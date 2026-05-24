@@ -1,6 +1,0 @@
-projectKey=Witer
-serverUrl=http://localhost:9000
-serverVersion=26.1.0.118079
-dashboardUrl=http://localhost:9000/dashboard?id=Witer
-ceTaskId=7032c888-73b4-49a1-a713-f2353b92be0a
-ceTaskUrl=http://localhost:9000/api/ce/task?id=7032c888-73b4-49a1-a713-f2353b92be0a

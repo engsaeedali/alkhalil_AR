@@ -1,9 +1,42 @@
-venv/
+# Python
 __pycache__/
-*.log
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+*.egg-info/
+
+# Environment
 .env
-.DS_Store
-backend/__pycache__/
-backend/venv/
-frontend/.next/
+*.env.local
+
+# Logs
+*.log
+server.log
+startup*.log
+
+# Node.js
 frontend/node_modules/
+frontend/.next/
+
+# System
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.scannerwork/
+sonar-project.properties
+A1/
+
+# Documents & Personal Files
+documents/
+*.pdf
+*.one
+*.onetoc2
+Token_Scanner.txt
+
+# Backup files
+*.bak
+*.bak.*
+"prompts - Copy.py"

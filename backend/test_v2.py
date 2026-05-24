@@ -5,7 +5,11 @@ import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from agent.graph import app_graph
-from termcolor import colored
+try:
+    from termcolor import colored
+except ImportError:
+    def colored(text, color=None, on_color=None, attrs=None):
+        return text
 
 def test_sovereign_agent():
     print(colored("--- Starting V2 Sovereign Agent Test ---", "cyan"))

@@ -17,10 +17,21 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, validator
 import httpx
 
-from agent.graph import app_graph
-from agent.helpers import get_llm
 from utils.logger_config import setup_logger
-from processors.document_processor import DocumentProcessor  
+
+# Safe loading of core modules to prevent startup crashes on serverless platforms
+startup_error = None
+app_graph = None
+get_llm = None
+DocumentProcessor = None
+
+try:
+    from agent.graph import app_graph
+    from agent.helpers import get_llm
+    from processors.document_processor import DocumentProcessor  
+except Exception as e:
+    import traceback
+    startup_error = traceback.format_exc()
 
 try:
     from langchain_google_genai import ChatGoogleGenerativeAI
@@ -333,6 +344,12 @@ async def health_check():
 
 @app.get("/", summary="مؤشر الجاهزية البنائي المباشر لمدونة الخليل")
 async def root():
+    if startup_error:
+        return {
+            "status": "error",
+            "message": "عطل في تهيئة مكتبات محرك الخليل",
+            "traceback": startup_error
+        }
     return {
         "message": "مدونة الخليل للتحرير اللغوي تعمل بنجاح وبكامل استقرارها السيادي العربي.",
         "status": "active",

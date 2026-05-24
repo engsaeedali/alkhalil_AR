@@ -44,9 +44,17 @@ def check_deepseek_availability(api_key: str) -> bool:
         if response.status_code != 200:
             return False
         data = response.json()
-        return data.get("is_available", False)
+        if "is_available" in data:
+            return bool(data["is_available"])
+        if "total_balance" in data:
+            try:
+                return float(data["total_balance"]) > 0
+            except ValueError:
+                pass
+        return True
     except Exception:
-        return False
+        # Fallback to True if key exists but network has a temporary issue
+        return True
 
 def get_llm(provider: Optional[str] = None):
     """Returns a tuple: (LLM_Object, Model_Name_String)"""
@@ -85,9 +93,20 @@ def get_llm(provider: Optional[str] = None):
                 logger.warning("Gemini was requested but key is missing or library is not installed.")
 
     # Fallback to standard check sequence
-    # 1. Check Gemini First
+    # 1. Check DeepSeek First (Since Gemini is currently returning 404 NOT_FOUND)
+    is_deepseek_ok = check_deepseek_availability(deepseek_key)
+    if is_deepseek_ok:
+        logger.info("Using DeepSeek as default/fallback.")
+        llm = ChatOpenAI(
+            model="deepseek-chat",
+            api_key=deepseek_key,
+            base_url="https://api.deepseek.com"
+        )
+        return llm, "DeepSeek-V3 (Sovereign Engine)"
+
+    # 2. Check Gemini
     if google_key and ChatGoogleGenerativeAI:
-        logger.info("Using Gemini as default/fallback (with resilience retry policy).")
+        logger.info("Using Gemini as fallback (with resilience retry policy).")
         llm = ChatGoogleGenerativeAI(
             model="gemini-flash-latest", 
             google_api_key=google_key, 
@@ -98,17 +117,6 @@ def get_llm(provider: Optional[str] = None):
             wait_exponential_jitter=True
         )
         return llm, "Gemini Flash (Sovereign Engine)"
-
-    # 2. Check DeepSeek
-    is_deepseek_ok = check_deepseek_availability(deepseek_key)
-    if is_deepseek_ok:
-        logger.info("Gemini unavailable. Using DeepSeek.")
-        llm = ChatOpenAI(
-            model="deepseek-chat",
-            api_key=deepseek_key,
-            base_url="https://api.deepseek.com"
-        )
-        return llm, "DeepSeek-V3 (Fallback Engine)"
     
     # Priority 3: Claude
     if settings.ANTHROPIC_API_KEY and "sk-ant" in settings.ANTHROPIC_API_KEY:

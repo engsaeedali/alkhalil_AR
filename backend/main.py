@@ -271,7 +271,7 @@ async def preflight_check(
         try:
             # استخدام محرك سريع وبدون إعادة محاولة للتأكد الفوري من المفتاح
             check_llm = ChatGoogleGenerativeAI(
-                model="gemini-1.5-flash", 
+                model="gemini-2.5-flash", 
                 google_api_key=g_key,
                 max_retries=0
             )

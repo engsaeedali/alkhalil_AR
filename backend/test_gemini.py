@@ -14,7 +14,7 @@ for key_name, key in [("GOOGLE_API_KEY", google_key), ("GEMINI_API_KEY", gemini_
     if not key:
         continue
     print(f"\n--- Testing with {key_name} ---")
-    models = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
+    models = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
     for model in models:
         try:
             print(f"Testing model: {model}")

@@ -80,7 +80,7 @@ def get_llm(provider: Optional[str] = None):
             if google_key and ChatGoogleGenerativeAI:
                 logger.info("Using Gemini as requested (with resilience retry policy).")
                 llm = ChatGoogleGenerativeAI(
-                    model="gemini-flash-latest", 
+                    model="gemini-2.5-flash", 
                     google_api_key=google_key, 
                     temperature=0.7,
                     max_retries=10
@@ -108,7 +108,7 @@ def get_llm(provider: Optional[str] = None):
     if google_key and ChatGoogleGenerativeAI:
         logger.info("Using Gemini as fallback (with resilience retry policy).")
         llm = ChatGoogleGenerativeAI(
-            model="gemini-flash-latest", 
+            model="gemini-2.5-flash", 
             google_api_key=google_key, 
             temperature=0.7,
             max_retries=10

@@ -1,12 +1,12 @@
 import os
 import sys
 
-# Add backend root to sys.path to resolve imports correctly in monorepos on Vercel
+# تثبيت المسارات لضمان سلامة التجميع على خوادم الإنتاج (Vercel)
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
-from fastapi import FastAPI
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Any
@@ -14,10 +14,12 @@ import httpx
 from agent.graph import app_graph
 from agent.helpers import get_llm
 from utils.logger_config import setup_logger
+from processors.document_processor import DocumentProcessor
 
 logger = setup_logger("main")
 
-app = FastAPI(title="The Linguistic Engineer Agent", version="2.0.0")
+# تهيئة خادم مدونة الخليل بالعنوان الفصيح الرسمي الجديد
+app = FastAPI(title="مدونة الخليل للتحرير اللغوي", version="2.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,8 +45,7 @@ class PreflightRequest(BaseModel):
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
-    logger.info(f"Received chat request. Input length: {len(request.message)}")
-    # Initial state
+    logger.info(f"بدء استقبال طلب محادثة. حجم النص المدخل: {len(request.message)}")
     initial_state = {
         "input_text": request.message,
         "current_text": request.message,
@@ -52,18 +53,13 @@ async def chat(request: ChatRequest):
         "editor_notes": [],
         "revision_count": 0,
         "status": "processing",
-        # Initialize new fields to avoid key errors if graph fails early
         "memory_context": [],
         "violations": [],
         "metric_scores": {}
     }
     
     try:
-        # Run the graph
-        logger.info("Invoking agent graph...")
         result = await app_graph.ainvoke(initial_state)
-        logger.info("Agent graph execution completed successfully.")
-        
         return {
             "manuscript": result.get("manuscript"),
             "editor_notes": result.get("editor_notes"),
@@ -76,35 +72,34 @@ async def chat(request: ChatRequest):
             "status": "completed"
         }
     except Exception as e:
-        logger.error(f"Error during chat processing: {str(e)}", exc_info=True)
+        logger.error(f"خلل أثناء معالجة المحادثة: {str(e)}", exc_info=True)
         raise e
-
-from fastapi import File, UploadFile, HTTPException
-from processors.document_processor import DocumentProcessor
 
 @app.post("/extract-text")
 async def extract_text(file: UploadFile = File(...)):
-    logger.info(f"Extracting text from uploaded file: {file.filename}")
+    logger.info(f"جاري استخراج النص من المخطوطة المرفوعة: {file.filename}")
     if not file.filename.endswith(".docx"):
-        logger.warning("Invalid file type uploaded for text extraction.")
-        raise HTTPException(status_code=400, detail="Only .docx files are supported")
+        raise HTTPException(status_code=400, detail="عذراً، لا يتم قبول سوى الوثائق بصيغة .docx فقط")
     try:
         content = await file.read()
         extracted_text = DocumentProcessor.extract_text_from_docx(content)
-        logger.info(f"Extracted {len(extracted_text)} characters from {file.filename}.")
         return {
             "text": extracted_text,
             "filename": file.filename,
             "size": len(content)
         }
     except Exception as e:
-        logger.error(f"Error during text extraction: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to extract text: {str(e)}")
+        logger.error(f"فشل استخراج النص من الوثيقة: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"فشل استخراج النص: {str(e)}")
 
 @app.post("/preflight-check")
 async def preflight_check(request: PreflightRequest):
+    """
+    منفذ فحص نبض الجاهزية المسبق (طلب مرحبا)
+    لتأكيد استقرار المحرك وتطهير الرسائل من الألفاظ الهندسية.
+    """
     provider = request.provider.strip().lower()
-    logger.info(f"Received preflight check request for provider: {provider}")
+    logger.info(f"بدء فحص نبض الجاهزية للمساعد الذكي: {provider}")
     
     try:
         from langchain_google_genai import ChatGoogleGenerativeAI
@@ -114,9 +109,8 @@ async def preflight_check(request: PreflightRequest):
     if provider == "deepseek":
         ds_key = os.getenv("DEEPSEEK_API_KEY")
         if not ds_key:
-            return {"status": "error", "message": "مفتاح API الخاص بـ DeepSeek غير موجود في ملف الإعدادات .env"}
+            return {"status": "error", "message": "تنبيه: تهيئة خادم المساعد المختار غير مكتملة، يرجى تفقّد مفاتيح التهيئة."}
         try:
-            # First check balance and status
             async with httpx.AsyncClient() as client:
                 response = await client.get(
                     "https://api.deepseek.com/user/balance", 
@@ -126,38 +120,36 @@ async def preflight_check(request: PreflightRequest):
             if response.status_code == 200:
                 data = response.json()
                 if data.get("is_available"):
-                    # Test query using get_llm
                     llm, model_name = get_llm("deepseek")
-                    await llm.ainvoke("Hi")
+                    await llm.ainvoke("مرحبا")
                     return {"status": "ready", "message": "تم التحقق من جاهزية الخليل بنجاح والمحرك مستقر"}
                 else:
-                    return {"status": "error", "message": "اتصال DeepSeek يعمل ولكن الرصيد غير كافٍ (is_available = False)."}
+                    return {"status": "error", "message": "اتصال المساعد الذكي نشط ولكن الرصيد الحالي غير كافٍ لإتمام عملية السبك."}
             elif response.status_code == 402:
-                return {"status": "error", "message": "رصيد حساب DeepSeek غير كافٍ (Error 402)."}
+                return {"status": "error", "message": "رصيد حساب المساعد الذكي لا يسمح بمعالجة النصوص حالياً."}
             else:
-                return {"status": "error", "message": f"خادم DeepSeek أرجع رمز الاستجابة {response.status_code}"}
+                return {"status": "error", "message": f"استجابة غير متوقعة من خادم المساعد المختار (رمز الفشل {response.status_code})."}
         except Exception as e:
-            return {"status": "error", "message": f"فشل الاتصال بمزود الخدمة DeepSeek: {str(e)}"}
+            return {"status": "error", "message": "تعذر تأمين الاتصال بالمحرر الذكي؛ يرجى التحقق من استقرار الشبكة."}
             
     elif provider == "gemini":
         g_key = os.getenv("GOOGLE_API_KEY")
         if not g_key:
-            return {"status": "error", "message": "مفتاح API الخاص بـ Gemini غير موجود في ملف الإعدادات .env"}
+            return {"status": "error", "message": "تنبيه: تهيئة خادم المساعد المختار غير مكتملة، يرجى تفقّد مفاتيح التهيئة."}
         if not ChatGoogleGenerativeAI:
-            return {"status": "error", "message": "مكتبة langchain_google_genai غير مثبتة في بيئة العمل"}
+            return {"status": "error", "message": "مكتبة المعالجة الأساسية الموجهة لـ لغة الضاد غير متوفرة في الخلفية."}
         try:
             llm, model_name = get_llm("gemini")
-            await llm.ainvoke("Hi")
+            await llm.ainvoke("مرحبا")
             return {"status": "ready", "message": "تم التحقق من جاهزية الخليل بنجاح والمحرك مستقر"}
         except Exception as e:
-            return {"status": "error", "message": f"فشل الاتصال بمزود الخدمة Gemini: {str(e)}"}
+            return {"status": "error", "message": "تعذر تأمين الاتصال بالمحرر الذكي؛ يرجى التحقق من استقرار الشبكة."}
     else:
-        return {"status": "error", "message": "مزود خدمة غير معروف. يرجى اختيار Gemini أو DeepSeek."}
+        return {"status": "error", "message": "المحرر الذكي المختار غير مدرج بالمكتبة، يرجى تحديد اختيار معتمد."}
 
 @app.post("/merge-drafts")
 async def merge_drafts(request: MergeRequest):
-    logger.info(f"Received merge request. Drafts: {[d['title'] for d in request.drafts]}")
-    # Construct initial state for the LangGraph workflow
+    logger.info(f"استقبال طلب دمج المسودات للمخطوطات: {[d['title'] for d in request.drafts]}")
     initial_state = {
         "drafts": request.drafts,
         "primary_draft_title": request.primary_draft_title,
@@ -168,7 +160,6 @@ async def merge_drafts(request: MergeRequest):
         "max_attempts": 1,
         "reconstruction_attempts": 0,
         "current_phase": "Master Draft",
-        # Initialize legacy compatibility fields
         "input_text": "",
         "current_text": "",
         "manuscript": "",
@@ -179,10 +170,8 @@ async def merge_drafts(request: MergeRequest):
     }
     
     try:
-        logger.info("Invoking agent graph for multi-draft merge...")
+        logger.info("استدعاء محرك التوجيه الدلالي لسبك ودمج النصوص...")
         result = await app_graph.ainvoke(initial_state)
-        logger.info("Agent graph execution for merge completed successfully.")
-        
         return {
             "manuscript": result.get("manuscript"),
             "editor_notes": result.get("editor_notes"),
@@ -195,24 +184,20 @@ async def merge_drafts(request: MergeRequest):
             "status": "completed"
         }
     except Exception as e:
-        logger.error(f"Error during merge processing: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Merge processing failed: {str(e)}")
+        logger.error(f"فشل عملية دمج وسبك النصوص: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"تعذرت صياغة المخطوطة: {str(e)}")
 
 @app.post("/upload")
 async def upload_document(file: UploadFile = File(...)):
-    logger.info(f"Received file upload: {file.filename}")
     if not file.filename.endswith(".docx"):
-        logger.warning("Invalid file type uploaded.")
-        raise HTTPException(status_code=400, detail="Only .docx files are supported")
+        raise HTTPException(status_code=400, detail="تنبيه: الملحق غير مدعوم، يرجى إرفاق مستند .docx")
     
     content = await file.read()
     extracted_text = DocumentProcessor.extract_text_from_docx(content)
-    logger.info(f"Extracted {len(extracted_text)} characters from document.")
     
     if not extracted_text:
-        raise HTTPException(status_code=400, detail="Could not extract text from document")
+        raise HTTPException(status_code=400, detail="تعذر استخراج النص المرجعي؛ المستند فارغ أو مكسور البنية.")
 
-    # Run the graph on the extracted text
     initial_state = {
         "input_text": extracted_text,
         "current_text": extracted_text,
@@ -226,10 +211,7 @@ async def upload_document(file: UploadFile = File(...)):
     }
     
     try:
-        logger.info("Invoking agent graph for document...")
         result = await app_graph.ainvoke(initial_state)
-        logger.info("Agent graph execution for document completed.")
-        
         return {
             "manuscript": result.get("manuscript"),
             "editor_notes": result.get("editor_notes"),
@@ -243,9 +225,14 @@ async def upload_document(file: UploadFile = File(...)):
             "original_text": extracted_text
         }
     except Exception as e:
-        logger.error(f"Error during document processing: {str(e)}", exc_info=True)
+        logger.error(f"خلل أثناء تهذيب المخطوطة المرفوعة: {str(e)}", exc_info=True)
         raise e
 
 @app.get("/")
 async def root():
-    return {"message": "The Linguistic Engineer is Online", "status": "sovereign", "version": "v2"}
+    # النص التعريفي الجذري لمدونة الخليل متوافق مع الفصاحة
+    return {
+        "message": "مدونة الخليل للتحرير اللغوي تعمل بنجاح وبكامل استقرارها السيادي.",
+        "status": "active",
+        "version": "v2.1"
+    }

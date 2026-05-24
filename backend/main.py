@@ -122,7 +122,7 @@ async def preflight_check(request: PreflightRequest):
                     # Test query using get_llm
                     llm, model_name = get_llm("deepseek")
                     await llm.ainvoke("Hi")
-                    return {"status": "ready", "message": "تم التحقق من اتصال DeepSeek بنجاح والمفتاح نشط."}
+                    return {"status": "ready", "message": "تم التحقق من جاهزية الخليل بنجاح والمحرك مستقر"}
                 else:
                     return {"status": "error", "message": "اتصال DeepSeek يعمل ولكن الرصيد غير كافٍ (is_available = False)."}
             elif response.status_code == 402:
@@ -141,7 +141,7 @@ async def preflight_check(request: PreflightRequest):
         try:
             llm, model_name = get_llm("gemini")
             await llm.ainvoke("Hi")
-            return {"status": "ready", "message": "تم التحقق من اتصال Gemini بنجاح والمفتاح نشط."}
+            return {"status": "ready", "message": "تم التحقق من جاهزية الخليل بنجاح والمحرك مستقر"}
         except Exception as e:
             return {"status": "error", "message": f"فشل الاتصال بمزود الخدمة Gemini: {str(e)}"}
     else:

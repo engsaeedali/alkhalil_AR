@@ -199,7 +199,7 @@ export default function SovereignChat() {
       };
 
       setUploadedFiles(prev => [primaryFileItem, ...prev.filter(f => !f.isPrimary)]);
-      setPrimaryText("جاري استخراج وقراءة نص المسودة الأساسية...");
+      setPrimaryText("جاري استخراج وقراءة النص المرجعي...");
       setHasSubDrafts(null); // Reset step 2 prompt
 
       const formData = new FormData();
@@ -211,7 +211,7 @@ export default function SovereignChat() {
           body: formData,
         });
 
-        if (!res.ok) throw new Error("فشل استخراج النص من المسودة المرجعية.");
+        if (!res.ok) throw new Error("فشل استخراج النص من المرجع اللغوي.");
         const data = await res.json();
         
         setUploadedFiles(prev => prev.map(f => f.id === fileId ? { ...f, content: data.text, status: "success" } : f));
@@ -225,7 +225,7 @@ export default function SovereignChat() {
       // Auxiliary drafts upload (up to 10 files)
       const currentAuxCount = uploadedFiles.filter(f => !f.isPrimary).length;
       if (currentAuxCount + docxFiles.length > 10) {
-        alert("الحد الأقصى للمسودات الفرعية هو 10 مسودات فقط.");
+        alert("الحد الأقصى للنصوص الرديفة هو 10 نصوص فقط.");
         return;
       }
 
@@ -279,8 +279,8 @@ export default function SovereignChat() {
     try {
       const logs = [
         "جاري فحص وتهيئة المستندات المرفوعة وتحديد أدوار الدمج...",
-        "جاري استدعاء محرك البحث واستخراج الأفكار الذرية (Atomic Ideas) من المسودات الفرعية...",
-        "جاري مطابقة الأفكار المكتشفة مع المسودة الأساسية ورصد النواقص...",
+        "جاري استدعاء محرك البحث واستخراج الأفكار الذرية من المسودات الرديفة...",
+        "جاري مطابقة الأفكار المكتشفة مع النص المرجعي ورصد النواقص...",
         "جاري صياغة النص الهجين الشامل بأسلوب الصياغة المحدد وحرية الأسلوب الأدبي...",
         "جاري تمرير المخطوطة عبر مرشحات التعديل والمطابقة الذاتية للتحقق من الصفر ثغرات...",
         "جاري توليد تقرير الجودة والمطابقة النهائي وتغذية لوحة التحرير..."
@@ -310,7 +310,7 @@ export default function SovereignChat() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           drafts: draftsPayload,
-          primary_draft_title: primaryFile?.name || "المسودة الأساسية.docx",
+          primary_draft_title: primaryFile?.name || "النص المرجعي.docx",
           style: selectedStyle,
           provider: selectedProvider,
           target_word_count: targetWordCount ? parseInt(targetWordCount) : null,
@@ -322,7 +322,7 @@ export default function SovereignChat() {
 
       if (!res.ok) {
         const errorData = await res.json().catch(() => ({}));
-        throw new Error(errorData.detail || "فشل طلب دمج المسودات من الخادم الرئيسي.");
+        throw new Error(errorData.detail || "فشل طلب دمج النصوص من الخادم الرئيسي.");
       }
 
       const data = await res.json();
@@ -336,7 +336,7 @@ export default function SovereignChat() {
         atomic_ideas: data.atomic_ideas,
         validation_report: data.validation_report,
         metadata: {
-          primary_draft_title: data.validation_report?.primary_draft_title || primaryFile?.name || "المسودة الأساسية.docx",
+          primary_draft_title: data.validation_report?.primary_draft_title || primaryFile?.name || "النص المرجعي.docx",
           total_input_drafts: data.validation_report?.total_ideas || draftsPayload.length,
           total_output_words: data.manuscript ? data.manuscript.split(/\s+/).filter(Boolean).length : 0,
           tokens_consumed: data.token_usage?.total_tokens || 0
@@ -347,7 +347,7 @@ export default function SovereignChat() {
         {
           id: Date.now().toString(),
           role: "user",
-          content: `طلب دمج وصياغة المسودات بأسلوب ${selectedStyle} باستخدام ${selectedProvider}`
+          content: `طلب دمج وصياغة النصوص بأسلوب ${selectedStyle} باستخدام ${selectedProvider}`
         },
         assistantMsg
       ]);
@@ -519,11 +519,11 @@ export default function SovereignChat() {
               {/* Custom Tooltip */}
               <div className="absolute top-10 right-0 z-50 hidden group-hover:block bg-slate-900 border border-amber-500/20 p-2.5 rounded-xl text-[9px] text-slate-300 w-44 shadow-2xl leading-relaxed">
                 <div className="flex justify-between mb-1">
-                  <span>المسودة الرئيسية:</span>
+                  <span>النص المرجعي:</span>
                   <span className="font-mono font-bold text-slate-200">{primaryWords.toLocaleString()}</span>
                 </div>
                 <div className="flex justify-between">
-                  <span>المسودات الفرعية:</span>
+                  <span>النصوص الرديفة:</span>
                   <span className="font-mono font-bold text-slate-200">{auxWords.toLocaleString()}</span>
                 </div>
               </div>
@@ -533,7 +533,7 @@ export default function SovereignChat() {
 
         {/* 2. عداد التحليل الزمني الحي (Live Execution Timer) */}
         <div className="flex flex-col items-center select-none">
-          <span className="text-[9px] text-slate-500 font-bold block mb-0.5">زمن التحليل والدمج الحي</span>
+          <span className="text-[9px] text-slate-500 font-bold block mb-0.5">ميقات السبك والتحوير الحي</span>
           <div className={cn(
             "text-sm font-black font-mono tracking-wider transition-colors duration-300",
             processPhase === "idle" 
@@ -615,7 +615,7 @@ export default function SovereignChat() {
               <div className="flex items-center justify-between border-b border-slate-800 pb-3">
                 <h3 className="text-sm font-extrabold text-slate-200 flex items-center gap-2 font-sans">
                   <Layers size={16} className="text-[#f59e0b]" />
-                  <span>لوحة المعطيات والتحكم</span>
+                  <span>لوحة التوجيه والتحكم</span>
                 </h3>
               </div>
 
@@ -626,7 +626,7 @@ export default function SovereignChat() {
                   
                   {/* Step 1: Model Provider Choice */}
                   <div className="space-y-1.5">
-                    <span className="text-[11px] font-bold text-amber-500 block font-sans">الخطوة 1: اختيار موفر الخدمة</span>
+                    <span className="text-[11px] font-bold text-amber-500 block font-sans">الخطوة 1: اختيار المحرر الذكي</span>
                     <div className="grid grid-cols-2 gap-1 bg-slate-900 p-0.5 rounded-xl border border-slate-800">
                       <button
                         onClick={() => setSelectedProvider("deepseek")}
@@ -677,7 +677,7 @@ export default function SovereignChat() {
 
                   {/* Step 2: Upload Primary Document */}
                   <div className="space-y-2">
-                    <span className="text-[11px] font-bold text-amber-500 block font-sans">الخطوة 2: المسودة الأساسية (المرجع)</span>
+                    <span className="text-[11px] font-bold text-amber-500 block font-sans">الخطوة 2: النص المرجعي (المصدر الأساسي)</span>
                     
                     {!primaryFile ? (
                       <div 
@@ -696,8 +696,8 @@ export default function SovereignChat() {
                         />
                         <UploadCloud size={24} className="text-amber-500/70 group-hover:scale-105 transition-transform" />
                         <div className="text-center">
-                          <p className="text-xs font-bold text-slate-300">ارفع المسودة المرجعية الأساسية</p>
-                          <p className="text-[9px] text-slate-500 mt-1">تستخدم كأساس لصياغة النص (.docx فقط)</p>
+                          <p className="text-xs font-bold text-slate-300">إيداع النص المرجعي الأساسي</p>
+                          <p className="text-[9px] text-slate-500 mt-1">يستخدم كركيزة لصياغة النص (.docx فقط)</p>
                         </div>
                       </div>
                     ) : (
@@ -738,17 +738,17 @@ export default function SovereignChat() {
                   {/* Step 3: Choose Sub-drafts option (Visible if primary uploaded successfully) */}
                   {isPrimaryLoaded && (
                     <div className="space-y-3.5 pt-1 border-t border-slate-800">
-                      <span className="text-[11px] font-bold text-amber-500 block font-sans">الخطوة 3: المسودات الإضافية والدمج</span>
+                      <span className="text-[11px] font-bold text-amber-500 block font-sans">الخطوة 3: النصوص الرديفة والدمج</span>
                       
                       {hasSubDrafts === null ? (
                         <div className="space-y-2">
-                          <p className="text-[10px] text-slate-400 leading-relaxed font-sans">هل لديك مسودات إضافية ترغب في دمج أفكارها ومقترحاتها الفريدة مع النص الأساسي؟</p>
+                          <p className="text-[10px] text-slate-400 leading-relaxed font-sans">هل لديك نصوص رديفة ترغب في دمج أفكارها ومقترحاتها مع النص المرجعي؟</p>
                           <div className="grid grid-cols-2 gap-2">
                             <button
                               onClick={() => setHasSubDrafts(true)}
                               className="py-2 px-3 bg-amber-950/40 hover:bg-amber-500/20 text-amber-500 border border-amber-500/30 rounded-xl text-xs font-bold transition-all duration-300 cursor-pointer hover:scale-[1.02]"
                             >
-                              نعم، دمج مسودات فرعية
+                              نعم، دمج نصوص رديفة
                             </button>
                             <button
                               onClick={() => {
@@ -757,7 +757,7 @@ export default function SovereignChat() {
                               }}
                               className="py-2 px-3 bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 rounded-xl text-xs font-bold transition-all duration-300 cursor-pointer hover:scale-[1.02]"
                             >
-                              لا، نص أساسي فقط
+                              لا، النص المرجعي فقط
                             </button>
                           </div>
                         </div>
@@ -781,7 +781,7 @@ export default function SovereignChat() {
                             />
                             <Paperclip size={16} className="text-slate-500" />
                             <div className="text-center">
-                              <p className="text-[11px] font-bold text-slate-300">ارفع المسودات الفرعية الإضافية</p>
+                              <p className="text-[11px] font-bold text-slate-300">إيداع النصوص الرديفة الإضافية</p>
                               <p className="text-[8px] text-slate-500 mt-0.5">يمكن رفع حتى 10 مستندات</p>
                             </div>
                           </div>
@@ -1039,7 +1039,7 @@ export default function SovereignChat() {
                 >
                   <div className="flex items-center justify-center gap-1.5">
                     <Sparkles size={14} />
-                    <span>تشغيل معالجة الأنظمة الهجينة</span>
+                    <span>بدء السبك الصياغي والدمج الذكي</span>
                   </div>
                 </button>
               </div>
@@ -1067,7 +1067,7 @@ export default function SovereignChat() {
             <h3 className="text-xs font-bold text-slate-300 font-sans flex items-center gap-2">
               <BookOpen size={14} className="text-[#f59e0b]" />
               <span>
-                {processPhase === "completed" ? "المخطوطة اللغوية الموحدة" : "محرر المسودة الأساسية (المعاينة والتحرير اليدوي)"}
+                {processPhase === "completed" ? "المخطوطة اللغوية الموحدة" : "منضدة النص المرجعي (المراجعة والتهذيب)"}
               </span>
             </h3>
 
@@ -1122,7 +1122,7 @@ export default function SovereignChat() {
                       <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-full text-amber-500 animate-pulse">
                         <Cpu size={24} />
                       </div>
-                      <h4 className="text-sm font-bold text-white">جاري معالجة وتوحيد النصوص عبر الأنظمة الهجينة</h4>
+                      <h4 className="text-sm font-bold text-white">جاري سبك وتوحيد النصوص عبر المحرك اللغوي الذكي</h4>
                       <p className="text-xs text-slate-500 max-w-sm leading-relaxed">
                         الرجاء الانتظار، يتم حالياً تحليل الفروق، مطابقة الأفكار وتوليف المخطوطة اللغوية النهائية.
                       </p>
@@ -1134,7 +1134,7 @@ export default function SovereignChat() {
                     onChange={(e) => setPrimaryText(e.target.value)}
                     disabled={processPhase === "processing" || processPhase === "preflight" || primaryFile.status !== "success"}
                     className="w-full flex-1 bg-transparent border-0 focus:ring-0 focus:outline-none text-slate-300 leading-relaxed text-justify font-sans text-sm resize-none"
-                    placeholder="اكتب أو عدل النص الأساسي للمسودة هنا..."
+                    placeholder="اكتب أو هذّب النص المرجعي الأساسي هنا..."
                   />
                 </div>
               ) : (
@@ -1143,9 +1143,9 @@ export default function SovereignChat() {
                   <div className="p-4 bg-slate-900/60 border border-slate-800 rounded-full text-slate-600 mb-4">
                     <FileText size={32} />
                   </div>
-                  <h4 className="text-sm font-bold text-slate-300">محرر المسودة الأساسية</h4>
+                  <h4 className="text-sm font-bold text-slate-300">منضدة النص المرجعي</h4>
                   <p className="text-xs text-slate-500 max-w-xs leading-relaxed mt-2 font-medium">
-                    يرجى رفع المسودة الأساسية المرجعية من لوحة التحكم الجانبية للبدء بالمعاينة والتحرير اليدوي قبل الصياغة الذكية.
+                    يرجى إيداع النص المرجعي من لوحة التوجيه الجانبية للبدء بالمراجعة والتهذيب قبل السبك اللغوي.
                   </p>
                 </div>
               )
@@ -1203,7 +1203,7 @@ export default function SovereignChat() {
                                   <div className="text-[9px] text-emerald-400 font-bold mb-1.5 flex items-center gap-1.5">
                                     <span>💡 فكرة مدمجة: {block.associated_idea_id}</span>
                                     <span>•</span>
-                                    <span>المسودة المصدر: {block.source}</span>
+                                    <span>المخطوطة المصدر: {block.source}</span>
                                   </div>
                                 )}
                                 <p className="text-sm text-slate-300 leading-relaxed text-justify">
@@ -1296,7 +1296,7 @@ export default function SovereignChat() {
                 // Checklist Placeholder before processing
                 <div className="flex-1 flex flex-col items-center justify-center text-center p-6 text-slate-600 opacity-60">
                   <BookOpen size={28} className="mb-2 text-slate-700" />
-                  <p className="text-xs font-medium">في انتظار رفع المسودات واستخراج الفروق...</p>
+                  <p className="text-xs font-medium">في انتظار إيداع النصوص واستخراج الفروق اللغوية...</p>
                 </div>
               ) : (
                 // checklist containing extracted ideas

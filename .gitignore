@@ -40,3 +40,6 @@ Token_Scanner.txt
 *.bak
 *.bak.*
 "prompts - Copy.py"
+
+# Local startup / agent runner scripts
+Run-Agent.ps1

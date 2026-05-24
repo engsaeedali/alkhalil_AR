@@ -1,8 +1,15 @@
+import os
+import sys
+
+# Add backend root to sys.path to resolve imports correctly in monorepos on Vercel
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Any
-import os
 import httpx
 from agent.graph import app_graph
 from agent.helpers import get_llm

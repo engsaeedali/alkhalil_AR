@@ -29,6 +29,22 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
+const getApiUrl = (): string => {
+  if (process.env.NEXT_PUBLIC_API_URL) {
+    return process.env.NEXT_PUBLIC_API_URL;
+  }
+  if (typeof window !== "undefined") {
+    const hostname = window.location.hostname;
+    if (hostname === "localhost" || hostname === "127.0.0.1") {
+      return "http://127.0.0.1:8000";
+    }
+    return "/_/backend";
+  }
+  return "http://127.0.0.1:8000";
+};
+
+const API_BASE_URL = getApiUrl();
+
 interface Message {
   id: string;
   role: "user" | "assistant";
@@ -146,7 +162,7 @@ export default function SovereignChat() {
       setPreflightSuccess(null);
       
       try {
-        const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000"}/preflight-check`, {
+        const res = await fetch(`${API_BASE_URL}/preflight-check`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ provider: selectedProvider })
@@ -206,7 +222,7 @@ export default function SovereignChat() {
       formData.append("file", file);
 
       try {
-        const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000"}/extract-text`, {
+        const res = await fetch(`${API_BASE_URL}/extract-text`, {
           method: "POST",
           body: formData,
         });
@@ -249,7 +265,7 @@ export default function SovereignChat() {
         formData.append("file", file);
 
         try {
-          const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000"}/extract-text`, {
+          const res = await fetch(`${API_BASE_URL}/extract-text`, {
             method: "POST",
             body: formData,
           });
@@ -305,7 +321,7 @@ export default function SovereignChat() {
           content: f.isPrimary ? primaryText : f.content
         }));
 
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000"}/merge-drafts`, {
+      const res = await fetch(`${API_BASE_URL}/merge-drafts`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

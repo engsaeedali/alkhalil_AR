@@ -269,7 +269,13 @@ async def preflight_check(
         if not ChatGoogleGenerativeAI:
             return {"status": "error", "message": "مكتبة المعالجة الأساسية الموجهة لـ لغة الضاد غير متوفرة في الخلفية."}
         try:
-            await llm.ainvoke("مرحبا")
+            # استخدام محرك سريع وبدون إعادة محاولة للتأكد الفوري من المفتاح
+            check_llm = ChatGoogleGenerativeAI(
+                model="gemini-1.5-flash", 
+                google_api_key=g_key,
+                max_retries=0
+            )
+            await check_llm.ainvoke("مرحبا")
             return {"status": "ready", "message": "تم التحقق من جاهزية الخليل بنجاح والمحرك مستقر"}
         except Exception as e:
             logger.error(f"فشل استدعاء نموذج Gemini الـ API: {str(e)}")

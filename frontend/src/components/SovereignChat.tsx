@@ -88,7 +88,7 @@ export default function SovereignChat() {
   
   // Step-by-Step UX states
   const [processPhase, setProcessPhase] = useState<"idle" | "preflight" | "processing" | "completed">("idle");
-  const [selectedProvider, setSelectedProvider] = useState<"gemini" | "deepseek">("gemini");
+  const [selectedProvider, setSelectedProvider] = useState<"gemini" | "deepseek">("deepseek");
   const [primaryText, setPrimaryText] = useState<string>("");
   const [hasSubDrafts, setHasSubDrafts] = useState<boolean | null>(null);
   const [preflightError, setPreflightError] = useState<string | null>(null);

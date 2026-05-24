@@ -12,6 +12,7 @@ from dotenv import load_dotenv, find_dotenv
 import os
 import json
 import re
+from typing import Optional, Any, List, Dict
 
 # Load env vars independently of settings
 load_dotenv(find_dotenv())

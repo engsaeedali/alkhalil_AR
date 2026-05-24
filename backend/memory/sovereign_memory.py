@@ -56,9 +56,9 @@ class SovereignMemory:
 
     def _save_graph(self):
         """Persist NetworkX graph to disk"""
-        # Ensure directory exists
-        os.makedirs(os.path.dirname(self.graph_path), exist_ok=True)
         try:
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(self.graph_path), exist_ok=True)
             # Convert non-serializable attributes if any
             nx.write_gml(self.graph, self.graph_path)
         except Exception as e:

@@ -245,8 +245,14 @@ async def preflight_check(
     try:
         llm, model_name = get_llm(provider)
     except Exception as e:
-        logger.error(f"فشل تهيئة واستدعاء دوال المحرك [{provider}]: {str(e)}")
-        return {"status": "error", "message": "عذراً، تعذرت تهيئة المحرك الذكي المختار لخلل داخلي في الملفات."}
+        import traceback
+        error_trace = traceback.format_exc()
+        logger.error(f"فشل تهيئة واستدعاء دوال المحرك [{provider}]: {error_trace}")
+        return {
+            "status": "error", 
+            "message": "عذراً، تعذرت تهيئة المحرك الذكي المختار لخلل داخلي في الملفات.",
+            "traceback": error_trace
+        }
         
     if provider == "deepseek":
         ds_key = os.getenv("DEEPSEEK_API_KEY")

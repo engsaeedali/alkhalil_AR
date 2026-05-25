@@ -3,7 +3,9 @@ try:
     from chromadb.config import Settings as ChromaSettings
 except ImportError:
     chromadb = None
-    print("WARNING: ChromaDB module could not be imported. Using MOCK MEMORY.")
+    from utils.logger_config import setup_logger
+    _logger = setup_logger("sovereign_memory")
+    _logger.warning("ChromaDB module could not be imported. Using MOCK MEMORY.")
 
 import networkx as nx
 from typing import List, Dict, Optional
@@ -13,6 +15,9 @@ from datetime import datetime
 
 from api.schemas import ArabicTerm, Chapter
 from config.settings import settings
+from utils.logger_config import setup_logger
+
+logger = setup_logger("sovereign_memory")
 
 class SovereignMemory:
     """
@@ -38,7 +43,7 @@ class SovereignMemory:
                 metadata={"hnsw:space": "cosine"}
             )
         except Exception as e:
-            print(f"WARNING: ChromaDB initialization failed ({e}). Using MOCK MEMORY. (Python 3.14 Issue likely)")
+            logger.warning(f"ChromaDB initialization failed ({e}). Using MOCK MEMORY. (Python 3.14 Issue likely)")
             self.use_mock = True
         
         # 2. Initialize Concept Graph (NetworkX)
@@ -52,7 +57,7 @@ class SovereignMemory:
             try:
                 self.graph = nx.read_gml(self.graph_path)
             except Exception as e:
-                print(f"Error loading graph, starting fresh: {e}")
+                logger.warning(f"Error loading graph, starting fresh: {e}")
 
     def _save_graph(self):
         """Persist NetworkX graph to disk"""
@@ -62,7 +67,7 @@ class SovereignMemory:
             # Convert non-serializable attributes if any
             nx.write_gml(self.graph, self.graph_path)
         except Exception as e:
-            print(f"Error saving graph: {e}")
+            logger.warning(f"Error saving graph: {e}")
 
     # --- Terminology Management ---
 
@@ -78,7 +83,7 @@ class SovereignMemory:
                 ids=[term.id]
             )
         else:
-            print(f"[MOCK] Added term to vector store: {term.english_term}")
+            logger.info(f"[MOCK] Added term to vector store: {term.english_term}")
         
         # Knowledge Graph
         self.graph.add_node(
@@ -136,7 +141,7 @@ class SovereignMemory:
                 ids=[chapter.id]
             )
         else:
-            print(f"[MOCK] Added chapter context: {chapter.title}")
+            logger.info(f"[MOCK] Added chapter context: {chapter.title}")
             
         # 2. Update Graph
         self.graph.add_node(chapter.id, type="chapter", label=chapter.title)

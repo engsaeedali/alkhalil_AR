@@ -24,6 +24,6 @@ def setup_logger(name: str):
             f_handler.setFormatter(f_format)
             logger.addHandler(f_handler)
         except Exception as e:
-            print(f"WARNING: File logging disabled: {e}")
+            logger.warning(f"File logging disabled: {e}")
 
     return logger

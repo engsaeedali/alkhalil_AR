@@ -2,7 +2,6 @@ import os
 import sys
 import uuid
 import logging
-import json
 from typing import List, Dict, Optional, Any
 from contextlib import asynccontextmanager
 
@@ -20,9 +19,7 @@ import httpx
 
 from utils.logger_config import setup_logger
 from processors.summarizer import ArabicExtractiveSummarizer
-from utils.summary_router import choose_summarizer_engine, get_engine_description, MIN_TEXT_FOR_LOCAL
-from tenacity import retry, stop_after_attempt, wait_exponential
-from langchain_openai import ChatOpenAI
+from utils.summary_router import choose_summarizer_engine, get_engine_description
 
 # Safe loading of core modules to prevent startup crashes on serverless platforms
 startup_error = None
@@ -77,14 +74,12 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 ALLOWED_ORIGINS = [
     "https://alamalholol.com",
     "https://edit.alamalholol.com",
-    "http://localhost:3000",  # لضمان استقرار بيئة التطوير المحلية لديك
-    "http://127.0.0.1:3000"
+    "http://localhost:3000"  # لضمان استقرار بيئة التطوير المحلية لديك
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -243,104 +238,6 @@ def build_khalil_response(result: dict) -> dict:
         "status": "completed"
     }
 
-def chunk_text(text: str, max_chunk_size: int = 8000) -> List[str]:
-    """تقسيم النصوص والكتب الطويلة جداً إلى أجزاء متساوية لمنع الهلوسة وانفجار الذاكرة"""
-    words = text.split()
-    chunks = []
-    for i in range(0, len(words), max_chunk_size):
-        chunks.append(" ".join(words[i:i + max_chunk_size]))
-    return chunks
-
-def get_llm_client(engine: str):
-    """تهيئة محركات الذكاء الاصطناعي بناءً على مفاتيح البيئة المحلية"""
-    if engine == "deepseek":
-        return ChatOpenAI(
-            openai_api_key=os.getenv("DEEPSEEK_API_KEY"),
-            openai_api_base="https://api.deepseek.com/v1",
-            model_name="deepseek-chat",
-            temperature=0.0
-        )
-    elif engine == "gemini":
-        if not ChatGoogleGenerativeAI:
-            raise HTTPException(status_code=422, detail="حزمة الاتصال بمحرك Gemini غير مثبتة أو مهيأة في السيرفر حالياً.")
-        return ChatGoogleGenerativeAI(
-            google_api_key=os.getenv("GOOGLE_API_KEY"),
-            model="gemini-1.5-flash",
-            temperature=0.0
-        )
-    elif engine == "openai":
-        return ChatOpenAI(
-            openai_api_key=os.getenv("OPENAI_API_KEY"),
-            model_name="gpt-4o",
-            temperature=0.0
-        )
-    else:
-        raise ValueError(f"المحرك {engine} غير مدعوم سحابياً.")
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def invoke_llm_with_retry(llm, prompt):
-    """شبكة حماية وإعادة محاولة تلقائية في حال تذبذب اتصال الشبكة المحلية أو الخادم"""
-    return llm.invoke(prompt)
-
-def extract_tokens_consumed(response) -> int:
-    """استخراج كمية التوكينات المستهلكة من استجابة المحرك الذكي بشكل آمن"""
-    try:
-        # 1. التحقق من التنسيق المعياري الموحد لـ LangChain
-        if hasattr(response, 'usage_metadata') and response.usage_metadata:
-            return response.usage_metadata.get("total_tokens", 0)
-        
-        # 2. التحقق من الخصائص الإضافية للاستجابة
-        if hasattr(response, 'response_metadata') and response.response_metadata:
-            meta = response.response_metadata
-            if "usage_metadata" in meta and meta["usage_metadata"]:
-                return meta["usage_metadata"].get("total_tokens", 0)
-            if "token_usage" in meta and meta["token_usage"]:
-                return meta["token_usage"].get("total_tokens", 0) or meta["token_usage"].get("total_token_count", 0)
-    except Exception as e:
-        logger.warning(f"تعذر استخراج استهلاك التوكنات: {str(e)}")
-    return 0
-
-def build_khalil_summary_response(
-    core_ideas: List[Dict],
-    numerical_ledger: List[Dict],
-    sovereign_keywords: List[str],
-    metadata: Dict,
-    output_format: str = "json"
-) -> Dict:
-    """القناة المركزية الموحدة لبناء الهيكل المعرفي المحدث ديناميكياً"""
-    extracted_count = metadata.get("ideas_extracted", 5)
-    
-    response = {
-        "summary_analytics": {
-            "core_ideas": core_ideas[:extracted_count],
-            "numerical_ledger": numerical_ledger[:15],
-            "sovereign_keywords": sovereign_keywords[:7],
-            "export_content": None,
-            "_metadata": metadata
-        }
-    }
-
-    ideas_lines = [f"{idea['id']}. {idea['idea']}" for idea in core_ideas[:extracted_count]]
-    numbers_lines = [f"- **{item['value']}**: {item['context']}" for item in numerical_ledger[:15]]
-    
-    response["summary_analytics"]["export_content"] = f"""# جَوْهَر المخطوطة — مدونة الخليل الفصيحة
-
-## 💡 الأفكار الجوهرية المعرفية
-{"\n".join(ideas_lines) if ideas_lines else '- تعذر استخلاص أفكار متكاملة.'}
-
-## 🔢 الكشاف الرقمي والتواريخ السياقية
-{"\n".join(numbers_lines) if numbers_lines else '- لا توجد أرقام حيوية بارزة في النص.'}
-
-## 📌 الكلمات المفتاحية السيادية
-{', '.join(sovereign_keywords) if sovereign_keywords else '- لا توجد'}
-
----
-*المحرك السيادي التشغيلي: {metadata.get('engine_description', 'unknown')}*
-*الوضع التشغيلي للتثبيت: بيئة التطوير المحلية (Local Machine)*
-*تكلفة التوكنات الخارجية: {metadata.get('tokens_consumed', 0)}*
-"""
-    return response
-
 def build_khalil_response_summary(
     core_ideas: List[Dict],
     numerical_ledger: List[Dict],
@@ -389,8 +286,6 @@ def build_khalil_response_summary(
 async def chat(request: ChatRequest):
     initial_state = create_initial_state(text=request.message)
     try:  
-        if not app_graph or startup_error:
-            raise HTTPException(status_code=503, detail="عذراً، الخدمة غير متوفرة حالياً بسبب فشل في تهيئة النظام الداخلي.")
         result = await app_graph.ainvoke(initial_state)
     except Exception as e:
         logger.error(f"فشل استدعاء دالة المحادثة في الـ Graph: {str(e)}")
@@ -488,8 +383,6 @@ async def merge_drafts(request: MergeRequest):
     )
     
     try:  
-        if not app_graph or startup_error:
-            raise HTTPException(status_code=503, detail="عذراً، الخدمة غير متوفرة حالياً بسبب فشل في تهيئة النظام الداخلي.")
         result = await app_graph.ainvoke(initial_state)
     except Exception as e:
         logger.error(f"فشل محرك التوجيه الدلالي أثناء سبك ودمج النصوص: {str(e)}")
@@ -508,8 +401,6 @@ async def upload_document(file: UploadFile = File(...)):
     initial_state = create_initial_state(text=extracted_text)
     
     try:  
-        if not app_graph or startup_error:
-            raise HTTPException(status_code=503, detail="عذراً، الخدمة غير متوفرة حالياً بسبب فشل في تهيئة النظام الداخلي.")
         result = await app_graph.ainvoke(initial_state)
     except Exception as e:
         logger.error(f"فشل معالجة المخطوطة المرفوعة في الـ Graph: {str(e)}")
@@ -517,114 +408,72 @@ async def upload_document(file: UploadFile = File(...)):
         
     return build_khalil_response(result)
 
-@app.post("/summarize", summary="بوابة استخراج الجوهر اللغوي المطور", response_class=JSONResponse)
+@app.post("/summarize", summary="التلخيص الذكي الموحد (بوابة العبور)", response_class=JSONResponse)
 async def summarize(request: SummaryRequest):
     text_length = len(request.text)
     
+    # التوجيه الذكي الآلي لحماية الموارد محلياً
     engine = choose_summarizer_engine(
         user_tier=request.user_tier,
         text_length=text_length,
         text=request.text,
         force_engine=request.force_engine
     )
+    
     engine_info = get_engine_description(engine)
-    logger.info(f"🎯 إطلاق المحرك السيادي المختار: {engine_info['name']}")
-
-    # معالجة النصوص القصيرة جداً محلياً تلافياً لهدر الموارد والوقت
+    logger.info(f"🎯 نظام التوجيه المحلي: المستخدم [{request.user_tier}] -> محرك [{engine}]")
+    
     if engine == "local_hybrid":
-        summary_result = ArabicExtractiveSummarizer.summarize(text=request.text, compression_ratio=request.ratio)
+        # احتساب الحد الأقصى للأفكار المستخلصة ديناميكياً بناءً على عدد الكلمات
+        word_count = len(request.text.split())
+        max_ideas = 20 if word_count > 5000 else 5
+
+        summary_result = ArabicExtractiveSummarizer.summarize(
+            text=request.text, 
+            compression_ratio=request.ratio, 
+            max_ideas=max_ideas
+        )
         keywords = ArabicExtractiveSummarizer.extract_keywords(request.text, top_k=5)
         numerical_ledger = ArabicExtractiveSummarizer.extract_numbers(request.text)
         
         raw_summary = summary_result.get("summary", "")
-        sentences = [s.strip() for s in raw_summary.split(".") if len(s.strip()) > 15]
-        core_ideas = [{"id": i + 1, "idea": sent} for i, sent in enumerate(sentences[:5])]
+        summary_sentences = summary_result.get("summary_sentences", [])
+        if summary_sentences:
+            core_ideas = [{"id": i + 1, "idea": sent} for i, sent in enumerate(summary_sentences)]
+        else:
+            sentences = [s.strip() for s in raw_summary.split(".") if len(s.strip()) > 15]
+            core_ideas = [{"id": i + 1, "idea": sent} for i, sent in enumerate(sentences)]
         
+        if not core_ideas and raw_summary:
+            core_ideas = [{"id": 1, "idea": raw_summary[:200]}]
+            
         metadata = {
             "processing_tier": "extractive_hybrid_free",
             "engine": engine,
             "engine_description": engine_info["name"],
             "tokens_consumed": 0,
-            "original_sentences": summary_result["_metadata"].get("original_sentences", 0),
-            "ideas_extracted": len(core_ideas)
-        }
-        return JSONResponse(status_code=200, content=build_khalil_summary_response(core_ideas, numerical_ledger, keywords, metadata, request.format))
-
-    # المعالجة الدلالية الفصيحة للكتب والمخطوطات عبر الـ LLMs
-    max_ideas = 20 if text_length > 15000 else 5
-    
-    try:
-        llm = get_llm_client(engine)
-        
-        # تفعيل آلية الـ Chunking لتأمين معالجة الكتب الضخمة
-        text_chunks = chunk_text(request.text, max_chunk_size=8000)
-        target_text = text_chunks[0] if len(text_chunks) == 1 else request.text[:30000] # قراءة النطاق الواسع للمخطوطة
-        
-        system_prompt = f"""
-        أنت "المستخلص اللغوي الدلالي v3.6" لـ "مدونة الخليل للتحرير اللغوي".
-        مهمتك الحصرية هي تفكيك النص واستخراج جوهره الفكري والرقمي وصياغته بأسلوب خبري بليغ ومكتمل الأركان النحوية.
-
-        قواعد الإنتاج الصارمة (Strict Operational Rules):
-        1. استخرج أهم {max_ideas} أفكار جوهرية يرتكز عليها النص. صغ كل فكرة في جملة خبرية وافية المعنى تفهم بمفردها وتطابق لغة العرب الفصحى. يُمنع استخراج عناوين جانية أو جمل مبتورة.
-        2. احصر كافة الأرقام، النسب المئوية، الميزانيات، أو التواريخ الحيوية واربط القيمة بسياقها التاريخي أو المالي الفعلي بدقة (افصل الحقلين تماماً).
-        3. استخرج أهم 7 كلمات مفتاحية تمثل الكشاف المعجمي الفعلي للنص. يُمنع منعاً باتاً استخراج أدوات الربط أو النفي مثل ("لا"، "بلbound"، "ما"، "على")، بل استخرج مصطلحات سيادية من صلب الموضوع.
-        4. المخرج الوحيد المسموح به هو كائن JSON صالح تماماً مطابق للهيكل أدناه، بدون أي مقدمات أو هوامش تفاعلية زائدة.
-
-        OUTPUT_SCHEMA:
-        {{
-            "core_ideas": [ {{ "id": 1, "idea": "نص الجملة الخبرية البليغة الكاملة" }} ],
-            "numerical_ledger": [ {{ "value": "الرقم أو التاريخ"، "context": "السياق الدلالي الدقيق للرقم" }} ],
-            "sovereign_keywords": ["مصطلح1", "مصطلح2"]
-        }}
-
-        النص المراد معالجته دلالياً:
-        ---
-        {target_text}
-        ---
-        """
-        
-        # استدعاء المحرك مع تفعيل درع الحماية وإعادة المحاولة التلقائية
-        response = invoke_llm_with_retry(llm, system_prompt)
-        
-        tokens_consumed = extract_tokens_consumed(response)
-        
-        clean_content = response.content.strip().replace("```json", "").replace("```", "").strip()
-        parsed_data = json.loads(clean_content)
-        
-        # حساب عدد الجمل الأصلية بدقة تامة باستخدام مقسم الجمل المحلي
-        raw_paragraphs = [p.strip() for p in request.text.split('\n') if len(p.strip()) > 30]
-        if not raw_paragraphs:
-            raw_paragraphs = [request.text.strip()]
-        all_sentences = []
-        for para in raw_paragraphs:
-            sents = ArabicExtractiveSummarizer._split_sentences(para)
-            all_sentences.extend(sents)
-        original_sentences_count = len(all_sentences)
-        
-        metadata = {
-            "processing_tier": "llm_generative_premium",
-            "engine": engine,
-            "engine_description": engine_info["name"],
-            "tokens_consumed": tokens_consumed,
-            "original_sentences": original_sentences_count,
-            "ideas_extracted": len(parsed_data.get("core_ideas", [])),
-            "numbers_extracted": len(parsed_data.get("numerical_ledger", [])),
-            "text_characters": text_length,
-            "chunks_processed": len(text_chunks)
+            "original_sentences": summary_result.get("_metadata", {}).get("original_sentences", 0)
         }
         
-        final_response = build_khalil_summary_response(
-            core_ideas=parsed_data.get("core_ideas", []),
-            numerical_ledger=parsed_data.get("numerical_ledger", []),
-            sovereign_keywords=parsed_data.get("sovereign_keywords", []),
+        response = build_khalil_response_summary(
+            core_ideas=core_ideas,
+            numerical_ledger=numerical_ledger,
+            sovereign_keywords=keywords,
             metadata=metadata,
-            output_format=request.format
+            output_format=request.format,
+            max_ideas=max_ideas
         )
-        return JSONResponse(status_code=200, content=final_response)
-
-    except Exception as e:
-        logger.error(f"⚠️ فشل عبور الطلب عبر المحرك السحابي [{engine}]: {str(e)}")
-        raise HTTPException(status_code=502, detail=f"فشل المحرك الذكي في صياغة الجوهر. السبب: {str(e)}")
+        return JSONResponse(status_code=200, content=response)
+        
+    # فرع المحرك السحابي للـ Premium (محجوب محلياً لحين قرار العميل بالرفع والتفعيل)
+    return JSONResponse(
+        status_code=200,
+        content={
+            "message": "المحرك المحلي الهجين يعمل؛ ومحرك الذكاء الاصطناعي مهيأ بانتظار إشارة النشر والتفعيل السحابي.",
+            "engine": engine,
+            "user_tier": request.user_tier
+        }
+    )
 
 @app.get("/health", summary="فحص صحة واستقرار الخدمة الشامل (Health Check)") 
 async def health_check():

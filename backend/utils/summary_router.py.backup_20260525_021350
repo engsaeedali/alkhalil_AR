@@ -1,0 +1,52 @@
+# -*- coding: utf-8 -*-
+
+"""
+utils/summary_router.py
+عقل المنصة التجاري المحلي - يتخذ قرار التوجيه بين المحرك المجاني والمدفوع لحماية الميزانية
+"""
+import re
+from typing import Literal
+
+EngineType = Literal["local_hybrid", "deepseek"]
+
+def choose_summarizer_engine(
+    user_tier: str,
+    text_length: int,
+    text: str,
+    force_engine: str = None
+) -> EngineType:
+    """محدد المحرك الذكي - يحمي طاقة استهلاك المفاتيح محلياً"""
+    if force_engine in ["local_hybrid", "deepseek"]:
+        return force_engine
+    
+    if user_tier == "free":
+        return "local_hybrid"
+    
+    if user_tier == "premium" and text_length < 1500:
+        return "deepseek"
+    
+    if text_length > 15000:
+        return "local_hybrid"
+    
+    number_count = len(re.findall(r'\b\d+\b', text))
+    if number_count > 8:
+        return "deepseek"
+    
+    if user_tier == "premium":
+        return "deepseek"
+    
+    return "local_hybrid"
+
+def get_engine_description(engine: EngineType) -> dict:
+    descriptions = {
+        "local_hybrid": {
+            "name": "المحرك الهجين المحلي (TextRank + TF-IDF)",
+            "tokens_cost": 0,
+            "speed": "فوري (أقل من 0.5 ثانية)"
+        },
+        "deepseek": {
+            "name": "DeepSeek-V3 (الذكاء الاصطناعي التوليدي الحقيقي)",
+            "tokens_cost": "حسب استهلاك الـ API المحلي"
+        }
+    }
+    return descriptions.get(engine, descriptions["local_hybrid"])

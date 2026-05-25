@@ -5,6 +5,25 @@ from dotenv import load_dotenv
 # Load env vars
 load_dotenv(".env")
 
+# Route prints to logger and redact API keys
+from utils.logger_config import setup_logger
+import builtins
+logger = setup_logger("test_deepseek")
+_original_print = builtins.print
+_sensitive_vals = [os.getenv(k, "") for k in ("DEEPSEEK_API_KEY", "GOOGLE_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")]
+
+def _safe_print(*args, **kwargs):
+    try:
+        s = " ".join(str(a) for a in args)
+        for v in _sensitive_vals:
+            if v:
+                s = s.replace(v, "<REDACTED_API_KEY>")
+        logger.info(s)
+    except Exception:
+        _original_print(*args, **kwargs)
+
+builtins.print = _safe_print
+
 try:
     from langchain_openai import ChatOpenAI
     print("SUCCESS: langchain_openai imported.")

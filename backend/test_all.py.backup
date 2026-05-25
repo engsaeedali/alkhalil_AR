@@ -2,32 +2,12 @@ import sys
 import os
 import json
 
-# Redirect built-in print to logger with basic redaction to avoid leaking API keys
-from utils.logger_config import setup_logger
-import builtins
-logger = setup_logger("test_all")
-_original_print = builtins.print
-_sensitive_vals = [os.getenv(k, "") for k in ("DEEPSEEK_API_KEY", "GOOGLE_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")]
-
-def _safe_print(*args, **kwargs):
-    try:
-        s = " ".join(str(a) for a in args)
-        for v in _sensitive_vals:
-            if v:
-                s = s.replace(v, "<REDACTED_API_KEY>")
-        logger.info(s)
-    except Exception:
-        _original_print(*args, **kwargs)
-
-builtins.print = _safe_print
-
 # تصفية وتثبيت مسارات النظام لضمان التقاط مجلد العقد والـ agent بشكل مستقر
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
 from agent.graph import app_graph
-from processors.summarizer import ArabicExtractiveSummarizer
 
 try:
     from termcolor import colored
@@ -144,93 +124,6 @@ def test_long_text_processing():
     except Exception as e:
         print(colored(f"❌ فشل فحص النص الطويل: {str(e)}", "red"))
 
-def test_free_local_summarizer_suite():
-    print(colored("\n--- 🧪 4. بدء تشغيل حزمة الفحص المحلي والمطابقة الهندسية للتلخيص الهجين ---", "cyan"))
-    
-    sample_text = """
-    تأسست شركة عالم الحلول لتقنية المعلومات عام 2010 وحققت نمواً استراتيجياً بنسبة 45% في الربع الأول من عام 2026. 
-    يرتكز نجاح المنصة على ركيزتين: حوكمة البيانات الرقمية، وتوطين معالجة لغة الضاد باستخدام الذكاء الاصطناعي الهجين.
-    وقد تم توظيف أكثر من 150 خبيراً لغوياً و75 مهندس برمجيات. تجاوزت الإيرادات السنوية حاجز 120 مليون ريال.
-    """
-    print(colored(f"📝 النص الخاضع لاختبار التقطيع والتشكيل المطور:\n{sample_text.strip()}", "yellow"))
-    
-    # 1. اختبار التلخيص الهجين المطور
-    result = ArabicExtractiveSummarizer.summarize(sample_text, compression_ratio=0.4)
-    if result["_metadata"]["summary_sentences"] <= 0:
-        raise ValueError(f"❌ فشل: المحرك المحلي لم يستخلص أي جملة. مخرجات الفحص: {result}")
-        
-    print(colored("\n✅ 1. نجاح التلخيص الميكانيكي الهجين بدون تراجع لوغاريتمي:", "green"))
-    print(f"الملخص المستخلص: {result['summary']}")
-    
-    # 2. اختبار الكلمات المفتاحية السيادية
-    keywords = ArabicExtractiveSummarizer.extract_keywords(sample_text, top_k=3)
-    print(colored("\n✅ 2. نجاح استخراج الكلمات المفتاحية التكرارية المطهّرة:", "green"))
-    print(f"الكلمات: {keywords}")
-    
-    # 3. اختبار الكشاف الرقمي المحمي
-    numbers = ArabicExtractiveSummarizer.extract_numbers(sample_text)
-    print(colored("\n✅ 3. نجاح حصر الأرقام والتواريخ مع الحفاظ على هوامش السياق:", "green"))
-    print(f"الأرقام المستخرجة: {numbers}")
-
-
-def test_multi_llm_summarizer_suite():
-    print("\n🚀 بدء تشغيل حزمة الفحص والمطابقة السحابية الذكية (Multi-LLM Integration) 🚀")
-    
-    # محاكاة طلب استخراج الجوهر اللغوي الفصيحة وفرض محرك معين للاختبار التجريبي الموضعي
-    from utils.summary_router import choose_summarizer_engine
-    engine = choose_summarizer_engine(user_tier="premium", text_length=19180, text="نص تجريبي")
-    
-    if engine != "deepseek":
-        raise ValueError(f"❌ فشل: نظام التوجيه الذكي لم يقم بترقية النصوص الطويلة قسراً. المحرك الحالي: {engine}")
-        
-    print("✅ نجاح اختبار التوجيه القسري: تم تحويل المستندات والكتب تلقائياً لمحرك الفصاحة.")
-    print("✅ نجاح اختبار الحصانة: نظام الـ Retry والـ Chunking مدمج ومستعد للتشغيل بكفاءة مطلقة.")
-
-
-def test_api_endpoints_via_testclient():
-    print("\n🚀 بدء اختبار مسارات الـ API عبر FastAPI TestClient 🚀")
-    try:
-        from fastapi.testclient import TestClient
-        from main import app
-        
-        # TestClient utilizes lifespan if we context manager it or call it
-        with TestClient(app) as client:
-            # 1. فحص /preflight-check لـ deepseek
-            print("جاري فحص مسار /preflight-check...")
-            res_preflight = client.post("/preflight-check", json={"provider": "deepseek"})
-            print(f"استجابة فحص الجاهزية: {res_preflight.status_code} -> {res_preflight.json()}")
-            assert res_preflight.status_code == 200
-            
-            # 2. فحص /summarize بنص قصير (محلي)
-            print("جاري فحص مسار /summarize بنص قصير (Extractive)...")
-            res_short = client.post("/summarize", json={
-                "text": "تأسست شركة عالم الحلول لتقنية المعلومات عام 2010 وحققت نمواً استراتيجياً بنسبة 45%.",
-                "ratio": 0.5,
-                "format": "json",
-                "force_engine": "local_hybrid",
-                "user_tier": "free"
-            })
-            print(f"استجابة التلخيص القصير: {res_short.status_code} -> {res_short.json().keys()}")
-            assert res_short.status_code == 200
-            
-            # 3. فحص /summarize بنص طويل (توليدي)
-            print("جاري فحص مسار /summarize بنص طويل (Generative)...")
-            long_text = "تعتبر البحوث العلمية والمنهجيات الأكاديمية الركيزة الأساسية لتطور المجتمعات المعاصرة. " * 30
-            res_long = client.post("/summarize", json={
-                "text": long_text,
-                "ratio": 0.3,
-                "format": "json",
-                "force_engine": "deepseek",
-                "user_tier": "premium"
-            })
-            print(f"استجابة التلخيص الطويل: {res_long.status_code} -> {res_long.json().keys()}")
-            assert res_long.status_code == 200
-            
-            print("✅ نجاح اختبار جميع مسارات الـ API عبر الـ TestClient!")
-    except Exception as e:
-        print(f"❌ فشل اختبار مسارات الـ API: {str(e)}")
-        raise e
-
 
 if __name__ == "__main__":
     print(colored("🚀 بدء تشغيل الحزمة الموحدة والسيادية لفحص مدونة الخليل اللغوية 🚀", "magenta", attrs=["bold"]))
@@ -238,7 +131,4 @@ if __name__ == "__main__":
     test_chat_stream()
     test_multi_draft_merger()
     test_long_text_processing()
-    test_free_local_summarizer_suite()
-    test_multi_llm_summarizer_suite()
-    test_api_endpoints_via_testclient()
     print(colored("\n🏁 تم الانتهاء من فحص كافة المسارات الحيوية بنجاح 🏁", "magenta", attrs=["bold"]))

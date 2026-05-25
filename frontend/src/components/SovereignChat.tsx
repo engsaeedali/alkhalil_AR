@@ -123,6 +123,13 @@ export default function SovereignChat() {
   const [highlightedIdea, setHighlightedIdea] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<string>("split"); // "split", "preview", "json"
   
+  // Summarizer states
+  const [operationMode, setOperationMode] = useState<"edit" | "summarize">("edit");
+  const [summaryRatio, setSummaryRatio] = useState<number>(0.3);
+  const [summaryFormat, setSummaryFormat] = useState<"json" | "markdown">("json");
+  const [forceEngine, setForceEngine] = useState<string>("auto");
+  const [summaryResult, setSummaryResult] = useState<any>(null);
+  
   const primaryFileInputRef = useRef<HTMLInputElement>(null);
   const auxFileInputRef = useRef<HTMLInputElement>(null);
   const blockRefs = useRef<Record<string, HTMLDivElement | null>>({});
@@ -155,6 +162,9 @@ export default function SovereignChat() {
 
   // Silent connection verification whenever selectedProvider changes
   useEffect(() => {
+    const controller = new AbortController();
+    const signal = controller.signal;
+
     const pingProvider = async () => {
       setCheckingProvider(true);
       setIsProviderReady(false);
@@ -165,7 +175,8 @@ export default function SovereignChat() {
         const res = await fetch(`${API_BASE_URL}/preflight-check`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ provider: selectedProvider })
+          body: JSON.stringify({ provider: selectedProvider }),
+          signal
         });
         
         if (!res.ok) {
@@ -180,14 +191,23 @@ export default function SovereignChat() {
           setPreflightError(data.message || "فشل التحقق من صلاحية مزود الخدمة.");
         }
       } catch (err: any) {
-        console.error("Provider ping failed:", err);
+        if (err.name === 'AbortError' || signal.aborted) {
+          return;
+        }
+        console.warn("Provider preflight check failed:", err.message || err);
         setPreflightError(err.message || "فشل الاتصال بمزود الخدمة.");
       } finally {
-        setCheckingProvider(false);
+        if (!signal.aborted) {
+          setCheckingProvider(false);
+        }
       }
     };
     
     pingProvider();
+
+    return () => {
+      controller.abort();
+    };
   }, [selectedProvider]);
 
   // File Upload Handler (distinguishes between Primary and Auxiliary drafts)
@@ -387,6 +407,83 @@ export default function SovereignChat() {
       setIsMerging(false);
     } finally {
       setIsMerging(false);
+    }
+  };
+
+  const handleSummarize = async () => {
+    if (!primaryText.trim()) {
+      alert("يرجى رفع المستند أو كتابة النص أولاً لتفعيل الاستخلاص.");
+      return;
+    }
+
+    setProcessPhase("processing");
+    setElapsedTime(0);
+    const startTime = Date.now();
+    if (timerRef.current) clearInterval(timerRef.current);
+    timerRef.current = setInterval(() => {
+      setElapsedTime(Date.now() - startTime);
+    }, 10);
+
+    try {
+      const logs = [
+        "جاري فحص النص المرجعي المستهدف...",
+        "جاري استدعاء محرك التلخيص الهجين الذكي لفرز الجمل...",
+        "جاري استخلاص الكشاف الرقمي والتواريخ مع الحفاظ على هوامش السياق...",
+        "جاري استخراج الكلمات المفتاحية السيادية وتوليد التقرير النهائي..."
+      ];
+      setMergeLogs([logs[0]]);
+      let logCounter = 1;
+      const logInterval = setInterval(() => {
+        if (logCounter < logs.length) {
+          setMergeLogs(curr => [...curr, logs[logCounter]]);
+          logCounter++;
+        } else {
+          clearInterval(logInterval);
+        }
+      }, 1500);
+
+      const res = await fetch(`${API_BASE_URL}/summarize`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text: primaryText,
+          user_tier: "free",
+          ratio: summaryRatio,
+          format: summaryFormat,
+          force_engine: forceEngine === "auto" 
+            ? (primaryText.length < 500 ? "local_hybrid" : selectedProvider) 
+            : forceEngine
+        })
+      });
+
+      clearInterval(logInterval);
+
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.detail || "فشل طلب التلخيص من الخادم الرئيسي.");
+      }
+
+      const data = await res.json();
+      
+      // Complete logs simulation
+      setMergeLogs(logs);
+
+      setSummaryResult(data.summary_analytics);
+      setProcessPhase("completed");
+
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+
+    } catch (error: any) {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+      console.error("Summarization error:", error);
+      alert(error.message || "حدث خطأ غير متوقع أثناء معالجة التلخيص.");
+      setProcessPhase("idle");
     }
   };
 
@@ -751,158 +848,267 @@ export default function SovereignChat() {
                     )}
                   </div>
 
-                  {/* Step 3: Choose Sub-drafts option (Visible if primary uploaded successfully) */}
+                  {/* Step 3: Choose operation mode and show options accordingly */}
                   {isPrimaryLoaded && (
-                    <div className="space-y-3.5 pt-1 border-t border-slate-800">
-                      <span className="text-[11px] font-bold text-amber-500 block font-sans">الخطوة 3: النصوص الرديفة والدمج</span>
-                      
-                      {hasSubDrafts === null ? (
-                        <div className="space-y-2">
-                          <p className="text-[10px] text-slate-400 leading-relaxed font-sans">هل لديك نصوص رديفة ترغب في دمج أفكارها ومقترحاتها مع النص المرجعي؟</p>
-                          <div className="grid grid-cols-2 gap-2">
-                            <button
-                              onClick={() => setHasSubDrafts(true)}
-                              className="py-2 px-3 bg-amber-950/40 hover:bg-amber-500/20 text-amber-500 border border-amber-500/30 rounded-xl text-xs font-bold transition-all duration-300 cursor-pointer hover:scale-[1.02]"
-                            >
-                              نعم، دمج نصوص رديفة
-                            </button>
-                            <button
-                              onClick={() => {
-                                setHasSubDrafts(false);
-                                setUploadedFiles(prev => prev.filter(f => f.isPrimary)); // Clear any aux if none wanted
-                              }}
-                              className="py-2 px-3 bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 rounded-xl text-xs font-bold transition-all duration-300 cursor-pointer hover:scale-[1.02]"
-                            >
-                              لا، النص المرجعي فقط
-                            </button>
-                          </div>
-                        </div>
-                      ) : hasSubDrafts ? (
-                        // Upload Auxiliary Drafts Zone
-                        <div className="space-y-3">
-                          <div 
-                            onClick={() => auxFileInputRef.current?.click()}
-                            className="border border-dashed border-slate-800 hover:border-amber-500 bg-slate-900/40 hover:bg-amber-500/5 hover:scale-[1.02] transition-all duration-300 rounded-2xl p-4 flex flex-col items-center justify-center gap-2 cursor-pointer shadow-sm hover:shadow-md"
-                          >
-                            <input
-                              type="file"
-                              ref={auxFileInputRef}
-                              onChange={(e) => {
-                                if (e.target.files) handleFilesUpload(e.target.files, false);
-                                e.target.value = "";
-                              }}
-                              accept=".docx"
-                              multiple
-                              className="hidden"
-                            />
-                            <Paperclip size={16} className="text-slate-500" />
-                            <div className="text-center">
-                              <p className="text-[11px] font-bold text-slate-300">إيداع النصوص الرديفة الإضافية</p>
-                              <p className="text-[8px] text-slate-500 mt-0.5">يمكن رفع حتى 10 مستندات</p>
-                            </div>
-                          </div>
-
-                          {/* Auxiliary Files List */}
-                          {hasAuxFiles && (
-                            <div className="space-y-2 max-h-36 overflow-y-auto pr-1">
-                              {uploadedFiles.filter(f => !f.isPrimary).map(file => (
-                                <div key={file.id} className="p-2 bg-slate-900 border border-slate-800 rounded-xl flex items-center justify-between gap-2">
-                                  <div className="flex items-center gap-2 min-w-0">
-                                    <FileText size={12} className="text-slate-400 shrink-0" />
-                                    <span className="text-[10px] text-slate-300 truncate">{file.name}</span>
-                                  </div>
-                                  <div className="flex items-center gap-1.5 shrink-0">
-                                    {file.status === "loading" && <RefreshCw size={10} className="animate-spin text-amber-500" />}
-                                    {file.status === "success" && <CheckCircle2 size={10} className="text-emerald-400" />}
-                                    <button
-                                      onClick={() => setUploadedFiles(prev => prev.filter(f => f.id !== file.id))}
-                                      className="text-slate-500 hover:text-red-400 transition-colors"
-                                    >
-                                      <Trash2 size={10} />
-                                    </button>
-                                  </div>
-                                </div>
-                              ))}
-                            </div>
+                    <div className="space-y-4 pt-1 border-t border-slate-800">
+                      <span className="text-[11px] font-bold text-amber-500 block font-sans">اختر نوع العملية</span>
+                      <div className="grid grid-cols-2 gap-1.5 bg-slate-900 p-0.5 rounded-xl border border-slate-800">
+                        <button
+                          onClick={() => setOperationMode("edit")}
+                          className={cn(
+                            "py-1.5 rounded-lg text-[10px] font-bold text-center transition-all duration-300 cursor-pointer",
+                            operationMode === "edit"
+                              ? "bg-amber-950/40 text-amber-500 border border-amber-500/30 ring-1 ring-amber-500/30 shadow-md font-black"
+                              : "text-slate-500 hover:text-slate-300 hover:scale-[1.02]"
                           )}
-
-                          <button 
-                            onClick={() => setHasSubDrafts(null)}
-                            className="text-[9px] text-[#f59e0b] hover:underline block text-left"
-                          >
-                            تغيير الاختيار
-                          </button>
-                        </div>
-                      ) : (
-                        // Individual refinement mode card
-                        <div className="p-3 bg-amber-950/40 border border-amber-500/30 rounded-xl flex items-center justify-between shadow-inner">
-                          <span className="text-xs text-amber-300 font-semibold font-sans">وضع التهذيب الفردي مفعل</span>
-                          <button 
-                            onClick={() => setHasSubDrafts(null)}
-                            className="text-[9px] text-[#f59e0b] hover:underline"
-                          >
-                            تغيير الاختيار
-                          </button>
-                        </div>
-                      )}
+                        >
+                          تحرير ودمج
+                        </button>
+                        <button
+                          onClick={() => setOperationMode("summarize")}
+                          className={cn(
+                            "py-1.5 rounded-lg text-[10px] font-bold text-center transition-all duration-300 cursor-pointer",
+                            operationMode === "summarize"
+                              ? "bg-amber-950/40 text-amber-500 border border-amber-500/30 ring-1 ring-amber-500/30 shadow-md font-black"
+                              : "text-slate-500 hover:text-slate-300 hover:scale-[1.02]"
+                          )}
+                        >
+                          تلخيص واستخلاص
+                        </button>
+                      </div>
                     </div>
                   )}
 
-                  {/* Step 3: Global Configurations (Style, Model Provider, Word target) */}
-                  {isPrimaryLoaded && (
-                    <div className="space-y-4 pt-1 border-t border-slate-800">
-                      
-                      {/* Writing Style */}
-                      <div className="space-y-1.5">
-                        <span className="text-[11px] font-bold text-amber-500 block font-sans">الأسلوب اللغوي</span>
-                        <div className="grid grid-cols-2 gap-1.5">
+                  {isPrimaryLoaded && operationMode === "edit" && (
+                    <>
+                      {/* Step 3: Choose Sub-drafts option (Visible if primary uploaded successfully) */}
+                      <div className="space-y-3.5 pt-4 border-t border-slate-800/40">
+                        <span className="text-[11px] font-bold text-amber-500 block font-sans">الخطوة 3: النصوص الرديفة والدمج</span>
+                        
+                        {hasSubDrafts === null ? (
+                          <div className="space-y-2">
+                            <p className="text-[10px] text-slate-400 leading-relaxed font-sans">هل لديك نصوص رديفة ترغب في دمج أفكارها ومقترحاتها مع النص المرجعي؟</p>
+                            <div className="grid grid-cols-2 gap-2">
+                              <button
+                                onClick={() => setHasSubDrafts(true)}
+                                className="py-2 px-3 bg-amber-950/40 hover:bg-amber-500/20 text-amber-500 border border-amber-500/30 rounded-xl text-xs font-bold transition-all duration-300 cursor-pointer hover:scale-[1.02]"
+                              >
+                                نعم، دمج نصوص رديفة
+                              </button>
+                              <button
+                                onClick={() => {
+                                  setHasSubDrafts(false);
+                                  setUploadedFiles(prev => prev.filter(f => f.isPrimary)); // Clear any aux if none wanted
+                                }}
+                                className="py-2 px-3 bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 rounded-xl text-xs font-bold transition-all duration-300 cursor-pointer hover:scale-[1.02]"
+                              >
+                                لا، النص المرجعي فقط
+                              </button>
+                            </div>
+                          </div>
+                        ) : hasSubDrafts ? (
+                          // Upload Auxiliary Drafts Zone
+                          <div className="space-y-3">
+                            <div 
+                              onClick={() => auxFileInputRef.current?.click()}
+                              className="border border-dashed border-slate-800 hover:border-amber-500 bg-slate-900/40 hover:bg-amber-500/5 hover:scale-[1.02] transition-all duration-300 rounded-2xl p-4 flex flex-col items-center justify-center gap-2 cursor-pointer shadow-sm hover:shadow-md"
+                            >
+                              <input
+                                type="file"
+                                ref={auxFileInputRef}
+                                onChange={(e) => {
+                                  if (e.target.files) handleFilesUpload(e.target.files, false);
+                                  e.target.value = "";
+                                }}
+                                accept=".docx"
+                                multiple
+                                className="hidden"
+                              />
+                              <Paperclip size={16} className="text-slate-500" />
+                              <div className="text-center">
+                                <p className="text-[11px] font-bold text-slate-300">إيداع النصوص الرديفة الإضافية</p>
+                                <p className="text-[8px] text-slate-500 mt-0.5">يمكن رفع حتى 10 مستندات</p>
+                              </div>
+                            </div>
+
+                            {/* Auxiliary Files List */}
+                            {hasAuxFiles && (
+                              <div className="space-y-2 max-h-36 overflow-y-auto pr-1">
+                                {uploadedFiles.filter(f => !f.isPrimary).map(file => (
+                                  <div key={file.id} className="p-2 bg-slate-900 border border-slate-800 rounded-xl flex items-center justify-between gap-2">
+                                    <div className="flex items-center gap-2 min-w-0">
+                                      <FileText size={12} className="text-slate-400 shrink-0" />
+                                      <span className="text-[10px] text-slate-300 truncate">{file.name}</span>
+                                    </div>
+                                    <div className="flex items-center gap-1.5 shrink-0">
+                                      {file.status === "loading" && <RefreshCw size={10} className="animate-spin text-amber-500" />}
+                                      {file.status === "success" && <CheckCircle2 size={10} className="text-emerald-400" />}
+                                      <button
+                                        onClick={() => setUploadedFiles(prev => prev.filter(f => f.id !== file.id))}
+                                        className="text-slate-500 hover:text-red-400 transition-colors"
+                                      >
+                                        <Trash2 size={10} />
+                                      </button>
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+
+                            <button 
+                              onClick={() => setHasSubDrafts(null)}
+                              className="text-[9px] text-[#f59e0b] hover:underline block text-left"
+                            >
+                              تغيير الاختيار
+                            </button>
+                          </div>
+                        ) : (
+                          // Individual refinement mode card
+                          <div className="p-3 bg-amber-950/40 border border-amber-500/30 rounded-xl flex items-center justify-between shadow-inner">
+                            <span className="text-xs text-amber-300 font-semibold font-sans">وضع التهذيب الفردي مفعل</span>
+                            <button 
+                              onClick={() => setHasSubDrafts(null)}
+                              className="text-[9px] text-[#f59e0b] hover:underline"
+                            >
+                              تغيير الاختيار
+                            </button>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Global Configurations (Style, Word target) */}
+                      <div className="space-y-4 pt-4 border-t border-slate-800/40">
+                        {/* Writing Style */}
+                        <div className="space-y-1.5">
+                          <span className="text-[11px] font-bold text-amber-500 block font-sans">الأسلوب اللغوي</span>
+                          <div className="grid grid-cols-2 gap-1.5">
+                            {[
+                              { id: "academic", label: "أكاديمي" },
+                              { id: "legal", label: "قانوني" },
+                              { id: "literary", label: "أدبي" },
+                              { id: "business", label: "عملي" }
+                            ].map(s => (
+                              <button
+                                key={s.id}
+                                onClick={() => setSelectedStyle(s.id)}
+                                className={cn(
+                                  "py-1.5 px-2 rounded-xl text-xs font-bold text-center border transition-all duration-300 hover:scale-[1.02] cursor-pointer",
+                                  selectedStyle === s.id
+                                    ? "bg-amber-950/40 border-amber-500/30 ring-1 ring-amber-500/30 text-amber-500 font-extrabold shadow-lg shadow-amber-500/5"
+                                    : "bg-slate-900 border-slate-800 text-slate-400 hover:text-white"
+                                )}
+                              >
+                                {s.label}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+
+                        {/* Target Word Count */}
+                        <div className="space-y-1.5">
+                          <span className="text-[11px] font-bold text-slate-300 block font-sans">الكلمات المستهدفة (اختياري)</span>
+                          <input 
+                            type="number"
+                            value={targetWordCount}
+                            onChange={(e) => setTargetWordCount(e.target.value)}
+                            placeholder="مثال: 1000 كلمة"
+                            className="w-full bg-slate-900 border border-slate-800 focus:border-amber-500 focus:ring-1 focus:ring-amber-500/30 rounded-xl py-1.5 px-3 focus:outline-none text-right font-mono text-xs text-slate-300 placeholder:text-slate-500"
+                          />
+                        </div>
+
+                        {/* Custom Intent Steering */}
+                        <div className="space-y-1.5 pt-1.5 border-t border-slate-800/40">
+                          <span className="text-[11px] font-bold text-amber-500 block font-sans">
+                            التوجيه المخصص (اختياري)
+                          </span>
+                          <textarea
+                            value={customIntent}
+                            onChange={(e) => setCustomIntent(e.target.value)}
+                            placeholder="اكتب هنا توجيهاتك الخاصة للمخطوطة (مثال: صياغة الأفكار الإدارية في قالب قصصي أدبي مترابط)..."
+                            className="w-full bg-slate-900 border border-slate-800 focus:border-amber-500 focus:ring-1 focus:ring-amber-500/30 rounded-xl p-3 text-right font-sans text-xs text-slate-300 placeholder:text-slate-500 resize-none min-h-[85px] focus:outline-none"
+                          />
+                        </div>
+                      </div>
+                    </>
+                  )}
+
+                  {isPrimaryLoaded && operationMode === "summarize" && (
+                    <div className="space-y-4 pt-4 border-t border-slate-800/40">
+                      {/* Summary Ratio Slider */}
+                      <div className="space-y-2">
+                        <div className="flex justify-between text-[11px] font-bold font-sans">
+                          <span className="text-amber-500">نسبة الاختصار المستهدفة</span>
+                          <span className="font-mono text-slate-300">{Math.round(summaryRatio * 100)}%</span>
+                        </div>
+                        <input
+                          type="range"
+                          min="0.1"
+                          max="0.6"
+                          step="0.05"
+                          value={summaryRatio}
+                          onChange={(e) => setSummaryRatio(parseFloat(e.target.value))}
+                          className="w-full h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-amber-500 focus:outline-none"
+                        />
+                        <div className="flex justify-between text-[8px] text-slate-500 font-mono">
+                          <span>10% (موجز جداً)</span>
+                          <span>60% (تفصيلي)</span>
+                        </div>
+                      </div>
+
+                      {/* Export Format Toggle */}
+                      <div className="space-y-1.5 pt-1.5 border-t border-slate-800/40">
+                        <span className="text-[11px] font-bold text-slate-300 block font-sans">صيغة المخرجات</span>
+                        <div className="grid grid-cols-2 gap-2 bg-slate-900 p-0.5 rounded-xl border border-slate-800">
+                          <button
+                            onClick={() => setSummaryFormat("json")}
+                            className={cn(
+                              "py-1.5 rounded-lg text-[10px] font-bold text-center transition-all duration-300 cursor-pointer",
+                              summaryFormat === "json"
+                                ? "bg-amber-950/40 text-amber-500 border border-amber-500/30 ring-1 ring-amber-500/30 shadow-md font-black"
+                                : "text-slate-500 hover:text-slate-300 hover:scale-[1.02]"
+                            )}
+                          >
+                            JSON الهيكلي
+                          </button>
+                          <button
+                            onClick={() => setSummaryFormat("markdown")}
+                            className={cn(
+                              "py-1.5 rounded-lg text-[10px] font-bold text-center transition-all duration-300 cursor-pointer",
+                              summaryFormat === "markdown"
+                                ? "bg-amber-950/40 text-amber-500 border border-amber-500/30 ring-1 ring-amber-500/30 shadow-md font-black"
+                                : "text-slate-500 hover:text-slate-300 hover:scale-[1.02]"
+                            )}
+                          >
+                            Markdown منسق
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Preferred Engine Toggle */}
+                      <div className="space-y-1.5 pt-1.5 border-t border-slate-800/40">
+                        <span className="text-[11px] font-bold text-slate-300 block font-sans">تفضيل المحرك</span>
+                        <div className="grid grid-cols-4 gap-1 bg-slate-900 p-0.5 rounded-xl border border-slate-800">
                           {[
-                            { id: "academic", label: "أكاديمي" },
-                            { id: "legal", label: "قانوني" },
-                            { id: "literary", label: "أدبي" },
-                            { id: "business", label: "عملي" }
-                          ].map(s => (
+                            { id: "auto", label: "تلقائي" },
+                            { id: "local_hybrid", label: "محلي" },
+                            { id: "deepseek", label: "DeepSeek" },
+                            { id: "gemini", label: "Gemini" }
+                          ].map(e => (
                             <button
-                              key={s.id}
-                              onClick={() => setSelectedStyle(s.id)}
+                              key={e.id}
+                              onClick={() => setForceEngine(e.id)}
                               className={cn(
-                                "py-1.5 px-2 rounded-xl text-xs font-bold text-center border transition-all duration-300 hover:scale-[1.02] cursor-pointer",
-                                selectedStyle === s.id
-                                  ? "bg-amber-950/40 border-amber-500/30 ring-1 ring-amber-500/30 text-amber-500 font-extrabold shadow-lg shadow-amber-500/5"
-                                  : "bg-slate-900 border-slate-800 text-slate-400 hover:text-white"
+                                "py-1.5 rounded-lg text-[9px] font-bold text-center transition-all duration-300 cursor-pointer",
+                                forceEngine === e.id
+                                  ? "bg-amber-950/40 text-amber-500 border border-amber-500/30 ring-1 ring-amber-500/30 shadow-md font-black"
+                                  : "text-slate-500 hover:text-slate-300 hover:scale-[1.02]"
                               )}
                             >
-                              {s.label}
+                              {e.label}
                             </button>
                           ))}
                         </div>
                       </div>
-
-                      {/* Target Word Count */}
-                      <div className="space-y-1.5">
-                        <span className="text-[11px] font-bold text-slate-300 block font-sans">الكلمات المستهدفة (اختياري)</span>
-                        <input 
-                          type="number"
-                          value={targetWordCount}
-                          onChange={(e) => setTargetWordCount(e.target.value)}
-                          placeholder="مثال: 1000 كلمة"
-                          className="w-full bg-slate-900 border border-slate-800 focus:border-amber-500 focus:ring-1 focus:ring-amber-500/30 rounded-xl py-1.5 px-3 focus:outline-none text-right font-mono text-xs text-slate-300 placeholder:text-slate-500"
-                        />
-                      </div>
-
-                      {/* Custom Intent Steering */}
-                      <div className="space-y-1.5 pt-1.5 border-t border-slate-800/40">
-                        <span className="text-[11px] font-bold text-amber-500 block font-sans">
-                          التوجيه المخصص (اختياري)
-                        </span>
-                        <textarea
-                          value={customIntent}
-                          onChange={(e) => setCustomIntent(e.target.value)}
-                          placeholder="اكتب هنا توجيهاتك الخاصة للمخطوطة (مثال: صياغة الأفكار الإدارية في قالب قصصي أدبي مترابط)..."
-                          className="w-full bg-slate-900 border border-slate-800 focus:border-amber-500 focus:ring-1 focus:ring-amber-500/30 rounded-xl p-3 text-right font-sans text-xs text-slate-300 placeholder:text-slate-500 resize-none min-h-[85px] focus:outline-none"
-                        />
-                      </div>
-
                     </div>
                   )}
 
@@ -962,55 +1168,111 @@ export default function SovereignChat() {
               ) : (
                 // Phase 3: Completed State (Metrics Dashboard)
                 <div className="space-y-5">
-                  <div className="bg-slate-900 p-3.5 rounded-2xl border border-slate-800 space-y-1.5 shadow-inner">
-                    <span className="text-[9px] text-slate-500 font-bold block">الملفات المستخدمة في الدمج</span>
-                    <div className="space-y-1">
-                      {uploadedFiles.map(file => (
-                        <div key={file.id} className="flex items-center justify-between text-[10px]">
-                          <span className="text-slate-300 truncate max-w-[170px] font-medium">{file.name}</span>
-                          <span className={cn("text-[8px] px-1.5 py-0.5 rounded font-bold border", 
-                            file.isPrimary 
-                              ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/25" 
-                              : "bg-amber-500/10 text-amber-400 border-amber-500/25"
-                          )}>
-                            {file.isPrimary ? "أساسي" : "فرعي"}
+                  {operationMode === "edit" ? (
+                    <>
+                      <div className="bg-slate-900 p-3.5 rounded-2xl border border-slate-800 space-y-1.5 shadow-inner">
+                        <span className="text-[9px] text-slate-500 font-bold block">الملفات المستخدمة في الدمج</span>
+                        <div className="space-y-1">
+                          {uploadedFiles.map(file => (
+                            <div key={file.id} className="flex items-center justify-between text-[10px]">
+                              <span className="text-slate-300 truncate max-w-[170px] font-medium">{file.name}</span>
+                              <span className={cn("text-[8px] px-1.5 py-0.5 rounded font-bold border", 
+                                file.isPrimary 
+                                  ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/25" 
+                                  : "bg-amber-500/10 text-amber-400 border-amber-500/25"
+                              )}>
+                                {file.isPrimary ? "أساسي" : "فرعي"}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      {/* Dynamic Metrics */}
+                      <div className="space-y-2">
+                        <span className="text-[10px] font-bold text-slate-400 block font-sans">مؤشرات الأداء اللغوي</span>
+                        
+                        <div className="grid grid-cols-2 gap-2">
+                          <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right">
+                            <span className="text-[8px] text-slate-500 block mb-0.5">التوكنات المستهلكة</span>
+                            <span className="text-xs font-bold text-amber-500 font-mono">
+                              {activeWorkspaceData?.tokenUsage?.total_tokens || 0}
+                            </span>
+                          </div>
+                          <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right">
+                            <span className="text-[8px] text-slate-500 block mb-0.5">سلامة البنية للـ Parser</span>
+                            <span className="text-xs font-bold text-emerald-400 font-mono">
+                              {activeWorkspaceData?.validation_report?.attempts === 0 ? "100%" : "98%"}
+                            </span>
+                          </div>
+                          <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right">
+                            <span className="text-[8px] text-slate-500 block mb-0.5">زمن الاستجابة</span>
+                            <span className="text-[11px] font-bold text-emerald-400 font-mono">
+                              {"1850ms -> 920ms"}
+                            </span>
+                          </div>
+                          <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right">
+                            <span className="text-[8px] text-slate-500 block mb-0.5">حجم الكلمات الناتج</span>
+                            <span className="text-xs font-bold text-slate-300 font-mono">
+                              {activeWorkspaceData?.metadata?.total_output_words || 0} كلمة
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+                    </>
+                  ) : (
+                    // Summarizer Dashboard Metrics
+                    <>
+                      <div className="bg-slate-900 p-3.5 rounded-2xl border border-slate-800 space-y-1.5 shadow-inner">
+                        <span className="text-[9px] text-slate-500 font-bold block">الملف الملخص</span>
+                        <div className="flex items-center justify-between text-[10px]">
+                          <span className="text-slate-300 truncate max-w-[170px] font-medium">{primaryFile?.name || "النص المباشر"}</span>
+                          <span className="text-[8px] px-1.5 py-0.5 rounded font-bold border bg-emerald-500/10 text-emerald-400 border-emerald-500/25">
+                            مستخلص
                           </span>
                         </div>
-                      ))}
-                    </div>
-                  </div>
+                      </div>
 
-                  {/* Dynamic Metrics */}
-                  <div className="space-y-2">
-                    <span className="text-[10px] font-bold text-slate-400 block font-sans">مؤشرات الأداء اللغوي</span>
-                    
-                    <div className="grid grid-cols-2 gap-2">
-                      <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right">
-                        <span className="text-[8px] text-slate-500 block mb-0.5">التوكنات المستهلكة</span>
-                        <span className="text-xs font-bold text-amber-500 font-mono">
-                          {activeWorkspaceData?.tokenUsage?.total_tokens || 0}
+                      {/* Dynamic Metrics */}
+                      <div className="space-y-2">
+                        <span className="text-[10px] font-bold text-slate-400 block font-sans">مؤشرات الاستخلاص والتلخيص</span>
+                        
+                        <div className="grid grid-cols-2 gap-2">
+                          <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right">
+                            <span className="text-[8px] text-slate-500 block mb-0.5">التوكنات الخارجية</span>
+                            <span className="text-xs font-bold text-amber-500 font-mono">
+                              {summaryResult?._metadata?.tokens_consumed || 0}
+                            </span>
+                          </div>
+                          <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right">
+                            <span className="text-[8px] text-slate-500 block mb-0.5">الجمل: الأصلية vs المستخلصة</span>
+                            <span className="text-xs font-bold text-emerald-400 font-mono">
+                              {summaryResult?._metadata?.original_sentences || 0} / {summaryResult?.core_ideas?.length || 0}
+                            </span>
+                          </div>
+                          <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right">
+                            <span className="text-[8px] text-slate-500 block mb-0.5">الكلمات المفتاحية السيادية</span>
+                            <span className="text-xs font-bold text-[#38bdf8] font-mono">
+                              {summaryResult?.sovereign_keywords?.length || 0} كلمات
+                            </span>
+                          </div>
+                          <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right">
+                            <span className="text-[8px] text-slate-500 block mb-0.5">عناصر الكشاف الرقمي</span>
+                            <span className="text-xs font-bold text-[#a78bfa] font-mono">
+                              {summaryResult?.numerical_ledger?.length || 0} قيم
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl text-right">
+                        <span className="text-[8px] text-slate-500 block mb-0.5">محرك التلخيص المعتمد</span>
+                        <span className="text-xs font-bold text-slate-300 font-sans">
+                          {summaryResult?._metadata?.engine_description || "المحرك المحلي الهجين"}
                         </span>
                       </div>
-                      <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right">
-                        <span className="text-[8px] text-slate-500 block mb-0.5">سلامة البنية للـ Parser</span>
-                        <span className="text-xs font-bold text-emerald-400 font-mono">
-                          {activeWorkspaceData?.validation_report?.attempts === 0 ? "100%" : "98%"}
-                        </span>
-                      </div>
-                      <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right">
-                        <span className="text-[8px] text-slate-500 block mb-0.5">زمن الاستجابة</span>
-                        <span className="text-[11px] font-bold text-emerald-400 font-mono">
-                          {"1850ms -> 920ms"}
-                        </span>
-                      </div>
-                      <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right">
-                        <span className="text-[8px] text-slate-500 block mb-0.5">حجم الكلمات الناتج</span>
-                        <span className="text-xs font-bold text-slate-300 font-mono">
-                          {activeWorkspaceData?.metadata?.total_output_words || 0} كلمة
-                        </span>
-                      </div>
-                    </div>
-                  </div>
+                    </>
+                  )}
 
                   {/* Completion Logs summary */}
                   <div className="bg-slate-900 p-3 rounded-2xl border border-slate-800 space-y-1.5 max-h-36 overflow-y-auto">
@@ -1028,7 +1290,11 @@ export default function SovereignChat() {
                   <button
                     onClick={() => {
                       setProcessPhase("idle");
-                      setActiveWorkspaceData(null);
+                      if (operationMode === "edit") {
+                        setActiveWorkspaceData(null);
+                      } else {
+                        setSummaryResult(null);
+                      }
                     }}
                     className="w-full py-2 px-3 border border-amber-500/30 text-amber-500 hover:bg-amber-500/5 hover:scale-[1.02] transition-all duration-300 rounded-xl text-xs font-bold text-center cursor-pointer"
                   >
@@ -1044,18 +1310,24 @@ export default function SovereignChat() {
             {processPhase !== "completed" && processPhase !== "processing" && processPhase !== "preflight" && (
               <div className="pt-6 border-t border-slate-800 space-y-3 mt-6">
                 <button
-                  onClick={handlePreflightAndMerge}
-                  disabled={!isReadyToRun || !isProviderReady || checkingProvider}
+                  onClick={operationMode === "edit" ? handlePreflightAndMerge : handleSummarize}
+                  disabled={operationMode === "edit" ? (!isReadyToRun || !isProviderReady || checkingProvider) : !isPrimaryLoaded}
                   className={cn(
                     "w-full py-3.5 rounded-xl font-bold text-xs tracking-wide transition-all duration-300 shadow-lg cursor-pointer",
-                    isReadyToRun && isProviderReady && !checkingProvider
+                    operationMode === "edit"
+                      ? (isReadyToRun && isProviderReady && !checkingProvider)
+                        ? "bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-600 hover:to-amber-700 text-black hover:scale-[1.02] hover:shadow-amber-500/20"
+                        : "bg-slate-900 border border-slate-800 text-slate-600 cursor-not-allowed"
+                      : isPrimaryLoaded
                       ? "bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-600 hover:to-amber-700 text-black hover:scale-[1.02] hover:shadow-amber-500/20"
                       : "bg-slate-900 border border-slate-800 text-slate-600 cursor-not-allowed"
                   )}
                 >
                   <div className="flex items-center justify-center gap-1.5">
                     <Sparkles size={14} />
-                    <span>بدء السبك الصياغي والدمج الذكي</span>
+                    <span>
+                      {operationMode === "edit" ? "بدء السبك الصياغي والدمج الذكي" : "بدء التلخيص واستخلاص الذروة"}
+                    </span>
                   </div>
                 </button>
               </div>
@@ -1167,125 +1439,259 @@ export default function SovereignChat() {
               )
             ) : (
               // Phase 3: Post-processing Output Viewers
-              activeWorkspaceData && (
-                <div className="h-full">
-                  
-                  {/* VIEW MODE 1: STRUCTURED VIEW WITH BORDER HIGHLIGHTS */}
-                  {viewMode === "split" && (
-                    <div className="space-y-4 pb-12">
-                      {activeWorkspaceData.master_draft_structured?.map((block) => {
-                        const isHeading = block.type === "heading";
-                        const isPrimary = block.is_primary;
-                        const hasIdea = !!block.associated_idea_id;
-                        const isBlockActive = activeBlockId === block.block_id;
-                        const isBlockHighlighted = highlightedBlock === block.block_id;
+              operationMode === "edit" ? (
+                activeWorkspaceData && (
+                  <div className="h-full">
+                    
+                    {/* VIEW MODE 1: STRUCTURED VIEW WITH BORDER HIGHLIGHTS */}
+                    {viewMode === "split" && (
+                      <div className="space-y-4 pb-12">
+                        {activeWorkspaceData.master_draft_structured?.map((block) => {
+                          const isHeading = block.type === "heading";
+                          const isPrimary = block.is_primary;
+                          const hasIdea = !!block.associated_idea_id;
+                          const isBlockActive = activeBlockId === block.block_id;
+                          const isBlockHighlighted = highlightedBlock === block.block_id;
 
-                        // Retrieve full idea description for tooltip
-                        const assocIdea = activeWorkspaceData.atomic_ideas?.find(idea => idea.id === block.associated_idea_id);
+                          // Retrieve full idea description for tooltip
+                          const assocIdea = activeWorkspaceData.atomic_ideas?.find(idea => idea.id === block.associated_idea_id);
 
-                        return (
-                          <div 
-                            key={block.block_id}
-                            ref={(el) => { blockRefs.current[block.block_id] = el; }}
-                            onClick={() => handleBlockClick(block)}
-                            className={cn(
-                              "p-4 rounded-2xl cursor-pointer transition-all duration-300 relative group/block",
-                              isHeading 
-                                ? "border-b border-slate-800 pb-2 hover:bg-white/5" 
-                                : isPrimary 
-                                ? "bg-slate-900 border border-slate-800 hover:border-amber-500/30 hover:bg-slate-900/80" 
-                                : "border-r-4 border-r-emerald-500 border-t border-l border-b border-emerald-500/20 bg-[#022c22]/80 hover:bg-[#022c22]/95 pl-4 pr-3 py-3 rounded-l-2xl rounded-r-sm shadow-inner",
-                              isBlockActive && "ring-2 ring-amber-500/30 bg-slate-900/60 border-amber-500",
-                              isBlockHighlighted && "animate-pulse ring-2 ring-amber-500/50 border-amber-500 bg-amber-950/30"
-                            )}
-                          >
-                            {/* Hover tooltip for sub-draft paragraph */}
-                            {!isPrimary && assocIdea && (
-                              <div className="absolute z-50 hidden group-hover/block:block bg-slate-950 border border-emerald-500/20 p-3 rounded-xl text-[10px] text-slate-200 w-72 shadow-2xl pointer-events-none -top-14 right-2 leading-relaxed">
-                                <span className="font-bold text-amber-500 block mb-1">💡 فكرة مدمجة ({assocIdea.id})</span>
-                                <span>{assocIdea.content}</span>
-                              </div>
-                            )}
-
-                            {isHeading ? (
-                              <h3 className="text-sm font-bold text-slate-200 flex items-center gap-2">
-                                <span className="w-1 h-3.5 bg-gradient-to-b from-amber-500 to-amber-600 rounded-full"></span>
-                                {block.text}
-                              </h3>
-                            ) : (
-                              <div>
-                                {/* Sub-draft info badge displayed above paragraph */}
-                                {!isPrimary && (
-                                  <div className="text-[9px] text-emerald-400 font-bold mb-1.5 flex items-center gap-1.5">
-                                    <span>💡 فكرة مدمجة: {block.associated_idea_id}</span>
-                                    <span>•</span>
-                                    <span>المخطوطة المصدر: {block.source}</span>
-                                  </div>
-                                )}
-                                <p className="text-sm text-slate-300 leading-relaxed text-justify">
-                                  {block.text}
-                                </p>
-                              </div>
-                            )}
-
-                            <div className="mt-2.5 pt-2 border-t border-slate-800 flex items-center justify-between text-[9px] text-slate-500">
-                              <span>المصدر: <strong className={isPrimary ? "text-slate-400" : "text-emerald-400 font-bold"}>{block.source}</strong></span>
-                              {hasIdea && (
-                                <span className="flex items-center gap-1 text-[8px] text-emerald-400 bg-emerald-400/5 px-2 py-0.5 rounded border border-emerald-500/10 font-mono">
-                                  ID: {block.associated_idea_id}
-                                </span>
+                          return (
+                            <div 
+                              key={block.block_id}
+                              ref={(el) => { blockRefs.current[block.block_id] = el; }}
+                              onClick={() => handleBlockClick(block)}
+                              className={cn(
+                                "p-4 rounded-2xl cursor-pointer transition-all duration-300 relative group/block",
+                                isHeading 
+                                  ? "border-b border-slate-800 pb-2 hover:bg-white/5" 
+                                  : isPrimary 
+                                  ? "bg-slate-900 border border-slate-800 hover:border-amber-500/30 hover:bg-slate-900/80" 
+                                  : "border-r-4 border-r-emerald-500 border-t border-l border-b border-emerald-500/20 bg-[#022c22]/80 hover:bg-[#022c22]/95 pl-4 pr-3 py-3 rounded-l-2xl rounded-r-sm shadow-inner",
+                                isBlockActive && "ring-2 ring-amber-500/30 bg-slate-900/60 border-amber-500",
+                                isBlockHighlighted && "animate-pulse ring-2 ring-amber-500/50 border-amber-500 bg-amber-950/30"
                               )}
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
+                            >
+                              {/* Hover tooltip for sub-draft paragraph */}
+                              {!isPrimary && assocIdea && (
+                                <div className="absolute z-50 hidden group-hover/block:block bg-slate-950 border border-emerald-500/20 p-3 rounded-xl text-[10px] text-slate-200 w-72 shadow-2xl pointer-events-none -top-14 right-2 leading-relaxed">
+                                  <span className="font-bold text-amber-500 block mb-1">💡 فكرة مدمجة ({assocIdea.id})</span>
+                                  <span>{assocIdea.content}</span>
+                                </div>
+                              )}
 
-                  {/* VIEW MODE 2: PLAIN MANUSCRIPT PREVIEW */}
-                  {viewMode === "preview" && (
-                    <div className="max-w-3xl mx-auto w-full space-y-6 pb-12">
-                      <div className="text-sm text-slate-300 leading-relaxed whitespace-pre-wrap select-text text-justify font-medium">
-                        {activeWorkspaceData.content}
+                              {isHeading ? (
+                                <h3 className="text-sm font-bold text-slate-200 flex items-center gap-2">
+                                  <span className="w-1 h-3.5 bg-gradient-to-b from-amber-500 to-amber-600 rounded-full"></span>
+                                  {block.text}
+                                </h3>
+                              ) : (
+                                <div>
+                                  {/* Sub-draft info badge displayed above paragraph */}
+                                  {!isPrimary && (
+                                    <div className="text-[9px] text-emerald-400 font-bold mb-1.5 flex items-center gap-1.5">
+                                      <span>💡 فكرة مدمجة: {block.associated_idea_id}</span>
+                                      <span>•</span>
+                                      <span>المخطوطة المصدر: {block.source}</span>
+                                    </div>
+                                  )}
+                                  <p className="text-sm text-slate-300 leading-relaxed text-justify">
+                                    {block.text}
+                                  </p>
+                                </div>
+                              )}
+
+                              <div className="mt-2.5 pt-2 border-t border-slate-800 flex items-center justify-between text-[9px] text-slate-500">
+                                <span>المصدر: <strong className={isPrimary ? "text-slate-400" : "text-emerald-400 font-bold"}>{block.source}</strong></span>
+                                {hasIdea && (
+                                  <span className="flex items-center gap-1 text-[8px] text-emerald-400 bg-emerald-400/5 px-2 py-0.5 rounded border border-emerald-500/10 font-mono">
+                                    ID: {block.associated_idea_id}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    {/* VIEW MODE 2: PLAIN MANUSCRIPT PREVIEW */}
+                    {viewMode === "preview" && (
+                      <div className="max-w-3xl mx-auto w-full space-y-6 pb-12">
+                        <div className="text-sm text-slate-300 leading-relaxed whitespace-pre-wrap select-text text-justify font-medium">
+                          {activeWorkspaceData.content}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* VIEW MODE 3: JSON STRUCTURE */}
+                    {viewMode === "json" && (
+                      <div className="h-full flex flex-col overflow-hidden pb-12">
+                        <textarea
+                          readOnly
+                          value={JSON.stringify(activeWorkspaceData, null, 2)}
+                          dir="ltr"
+                          className="flex-1 w-full p-4 bg-black/40 border border-slate-800 rounded-xl text-[10px] font-mono text-emerald-400 focus:outline-none resize-none overflow-y-auto leading-relaxed shadow-inner"
+                        />
+                      </div>
+                    )}
+
+                  </div>
+                )
+              ) : (
+                summaryResult && (
+                  <div className="space-y-6 pb-12 select-text">
+                    {/* 1. Sovereign Keywords Row */}
+                    <div className="bg-slate-900/60 p-5 rounded-2xl border border-slate-850 space-y-3">
+                      <h4 className="text-xs font-bold text-amber-400 flex items-center gap-1.5">
+                        <Sparkles size={14} />
+                        <span>📌 الكلمات المفتاحية السيادية</span>
+                      </h4>
+                      <div className="flex flex-wrap gap-2 pt-1">
+                        {summaryResult.sovereign_keywords?.map((kw: string, i: number) => (
+                          <span key={i} className="px-3 py-1 bg-amber-500/5 text-amber-400 border border-amber-500/20 rounded-full text-xs font-semibold font-sans tracking-wide">
+                            {kw}
+                          </span>
+                        ))}
                       </div>
                     </div>
-                  )}
 
-                  {/* VIEW MODE 3: JSON STRUCTURE */}
-                  {viewMode === "json" && (
-                    <div className="h-full flex flex-col overflow-hidden pb-12">
-                      <textarea
-                        readOnly
-                        value={JSON.stringify(activeWorkspaceData, null, 2)}
-                        dir="ltr"
-                        className="flex-1 w-full p-4 bg-black/40 border border-slate-800 rounded-xl text-[10px] font-mono text-emerald-400 focus:outline-none resize-none overflow-y-auto leading-relaxed shadow-inner"
-                      />
+                    {/* 2. Core Ideas */}
+                    <div className="bg-slate-900/60 p-5 rounded-2xl border border-slate-850 space-y-4">
+                      <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+                        <h4 className="text-xs font-bold text-amber-400 flex items-center gap-1.5">
+                          <Layers size={14} />
+                          <span>💡 الأفكار الجوهرية (مستخلص الذروة)</span>
+                        </h4>
+                        <button
+                          onClick={() => {
+                            const ideasText = summaryResult.core_ideas?.map((idea: any) => `${idea.id}. ${idea.idea}`).join("\n");
+                            copyToClipboard(ideasText, "summary_ideas_copy");
+                          }}
+                          className="flex items-center gap-1 text-[10px] text-amber-500 hover:underline cursor-pointer"
+                        >
+                          {copiedId === "summary_ideas_copy" ? <Check size={10} /> : <Copy size={10} />}
+                          <span>{copiedId === "summary_ideas_copy" ? "تم النسخ" : "نسخ الأفكار الجوهرية"}</span>
+                        </button>
+                      </div>
+                      <div className="space-y-2.5">
+                        {summaryResult.core_ideas?.map((idea: any, i: number) => (
+                          <div key={i} className="p-3 bg-slate-950/60 border border-slate-850 rounded-xl flex items-start gap-3">
+                            <span className="w-5 h-5 bg-amber-500/10 text-amber-400 border border-amber-500/20 rounded-lg flex items-center justify-center text-[10px] font-bold font-mono shrink-0 mt-0.5">
+                              {idea.id}
+                            </span>
+                            <p className="text-xs text-slate-300 leading-relaxed">{idea.idea}</p>
+                          </div>
+                        ))}
+                      </div>
                     </div>
-                  )}
 
-                </div>
+                    {/* 3. Numerical Ledger */}
+                    <div className="bg-slate-900/60 p-5 rounded-2xl border border-slate-850 space-y-4">
+                      <h4 className="text-xs font-bold text-amber-400 flex items-center gap-1.5">
+                        <Activity size={14} />
+                        <span>🔢 الكشاف الرقمي والتواريخ الحيوية</span>
+                      </h4>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        {summaryResult.numerical_ledger?.map((num: any, i: number) => (
+                          <div key={i} className="p-3 bg-slate-950/60 border border-slate-850 rounded-xl space-y-1.5">
+                            <div className="flex items-center justify-between">
+                              <span className="px-2 py-0.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded text-[9px] font-bold font-mono">
+                                {num.value}
+                              </span>
+                            </div>
+                            <p className="text-[10px] text-slate-400 leading-relaxed italic">"{num.context}"</p>
+                          </div>
+                        ))}
+                        {(!summaryResult.numerical_ledger || summaryResult.numerical_ledger.length === 0) && (
+                          <div className="p-3 bg-slate-950/60 border border-slate-850 rounded-xl text-center text-xs text-slate-500 col-span-2">
+                            لا توجد أرقام أو تواريخ بارزة في النص.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* 4. Export & Copy Panel */}
+                    {summaryFormat === "markdown" && summaryResult.export_content && (
+                      <div className="bg-slate-900/60 p-5 rounded-2xl border border-slate-850 space-y-3">
+                        <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+                          <h4 className="text-xs font-bold text-slate-300">مستند التصدير الجاهز (Markdown)</h4>
+                          <button
+                            onClick={() => copyToClipboard(summaryResult.export_content, "summary_export")}
+                            className="flex items-center gap-1 text-[10px] text-amber-500 hover:underline cursor-pointer"
+                          >
+                            {copiedId === "summary_export" ? <Check size={10} /> : <Copy size={10} />}
+                            <span>{copiedId === "summary_export" ? "تم النسخ" : "نسخ التلخيص"}</span>
+                          </button>
+                        </div>
+                        <pre className="p-4 bg-slate-950 rounded-xl text-[10px] text-slate-400 font-mono overflow-x-auto max-h-60 leading-relaxed whitespace-pre-wrap select-text">
+                          {summaryResult.export_content}
+                        </pre>
+                      </div>
+                    )}
+
+                    {summaryFormat === "json" && (
+                      <div className="bg-slate-900/60 p-5 rounded-2xl border border-slate-850 space-y-3">
+                        <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+                          <h4 className="text-xs font-bold text-slate-300">مستند التصدير الجاهز (JSON)</h4>
+                          <button
+                            onClick={() => copyToClipboard(JSON.stringify(summaryResult, null, 2), "summary_export_json")}
+                            className="flex items-center gap-1 text-[10px] text-amber-500 hover:underline cursor-pointer"
+                          >
+                            {copiedId === "summary_export_json" ? <Check size={10} /> : <Copy size={10} />}
+                            <span>{copiedId === "summary_export_json" ? "تم النسخ" : "نسخ التلخيص (JSON)"}</span>
+                          </button>
+                        </div>
+                        <pre className="p-4 bg-slate-950 rounded-xl text-[10px] text-slate-400 font-mono overflow-x-auto max-h-60 leading-relaxed whitespace-pre-wrap select-text">
+                          {JSON.stringify(summaryResult, null, 2)}
+                        </pre>
+                      </div>
+                    )}
+                  </div>
+                )
               )
             )}
 
           </div>
 
           {/* Export Action Bar (Completed phase only, fixed to bottom) */}
-          {processPhase === "completed" && activeWorkspaceData && (
+          {processPhase === "completed" && (activeWorkspaceData || summaryResult) && (
             <div className="absolute bottom-0 left-0 right-0 p-3 border-t border-slate-800 bg-slate-900/95 backdrop-blur z-20 flex justify-end gap-3 shrink-0">
-              <button 
-                onClick={() => copyToClipboard(activeWorkspaceData.content, "workspace_draft")}
-                className="px-4 py-2 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all duration-300 cursor-pointer text-slate-200 hover:border-amber-500/30 hover:scale-[1.02]"
-              >
-                {copiedId === "workspace_draft" ? <Check size={12} className="text-emerald-400" /> : <Copy size={12} />}
-                <span>نسخ النص الصافي الموحد</span>
-              </button>
-              <button 
-                onClick={() => handleDownload(JSON.stringify(activeWorkspaceData, null, 2), "workspace_json")}
-                className="px-4 py-2 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all duration-300 cursor-pointer text-slate-200 hover:border-amber-500/30 hover:scale-[1.02]"
-              >
-                <Download size={12} />
-                <span>تصدير JSON المخرجات</span>
-              </button>
+              {activeWorkspaceData ? (
+                <>
+                  <button 
+                    onClick={() => copyToClipboard(activeWorkspaceData.content, "workspace_draft")}
+                    className="px-4 py-2 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all duration-300 cursor-pointer text-slate-200 hover:border-amber-500/30 hover:scale-[1.02]"
+                  >
+                    {copiedId === "workspace_draft" ? <Check size={12} className="text-emerald-400" /> : <Copy size={12} />}
+                    <span>نسخ النص الصافي الموحد</span>
+                  </button>
+                  <button 
+                    onClick={() => handleDownload(JSON.stringify(activeWorkspaceData, null, 2), "workspace_json")}
+                    className="px-4 py-2 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all duration-300 cursor-pointer text-slate-200 hover:border-amber-500/30 hover:scale-[1.02]"
+                  >
+                    <Download size={12} />
+                    <span>تصدير JSON المخرجات</span>
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button 
+                    onClick={() => copyToClipboard(summaryResult.export_content || "", "summary_export_action")}
+                    className="px-4 py-2 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all duration-300 cursor-pointer text-slate-200 hover:border-amber-500/30 hover:scale-[1.02]"
+                  >
+                    {copiedId === "summary_export_action" ? <Check size={12} className="text-emerald-400" /> : <Copy size={12} />}
+                    <span>نسخ مستند التلخيص</span>
+                  </button>
+                  <button 
+                    onClick={() => handleDownload(JSON.stringify(summaryResult, null, 2), "summary_json")}
+                    className="px-4 py-2 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all duration-300 cursor-pointer text-slate-200 hover:border-amber-500/30 hover:scale-[1.02]"
+                  >
+                    <Download size={12} />
+                    <span>تصدير JSON التلخيص</span>
+                  </button>
+                </>
+              )}
             </div>
           )}
 
@@ -1294,7 +1700,7 @@ export default function SovereignChat() {
         {/* ========================================================================= */}
         {/* 3. LEFT PANE: CHECKLIST & ATOMIC IDEAS PANE (22-25% width)                 */}
         {/* ========================================================================= */}
-        {hasSubDrafts !== false && (
+        {operationMode === "edit" && hasSubDrafts !== false && (
           <div className="w-full lg:w-[280px] xl:w-[320px] shrink-0 border-r border-slate-800 bg-slate-950/50 backdrop-blur flex flex-col overflow-y-auto z-10">
             <div className="p-5 flex-1 flex flex-col">
               

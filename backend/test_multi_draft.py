@@ -5,6 +5,25 @@ import json
 # Add backend to sys.path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+# Route prints to logger and avoid leaking API keys
+from utils.logger_config import setup_logger
+import builtins, os
+logger = setup_logger("test_multi_draft")
+_original_print = builtins.print
+_sensitive_vals = [os.getenv(k, "") for k in ("DEEPSEEK_API_KEY", "GOOGLE_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")]
+
+def _safe_print(*args, **kwargs):
+    try:
+        s = " ".join(str(a) for a in args)
+        for v in _sensitive_vals:
+            if v:
+                s = s.replace(v, "<REDACTED_API_KEY>")
+        logger.info(s)
+    except Exception:
+        _original_print(*args, **kwargs)
+
+builtins.print = _safe_print
+
 from agent.graph import app_graph
 try:
     from termcolor import colored

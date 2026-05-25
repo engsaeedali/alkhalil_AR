@@ -11,6 +11,25 @@ except ImportError:
     def colored(text, color=None, on_color=None, attrs=None):
         return text
 
+# Route prints to logger and avoid leaking API keys
+from utils.logger_config import setup_logger
+import builtins, os
+logger = setup_logger("test_long_text")
+_original_print = builtins.print
+_sensitive_vals = [os.getenv(k, "") for k in ("DEEPSEEK_API_KEY", "GOOGLE_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")]
+
+def _safe_print(*args, **kwargs):
+    try:
+        s = " ".join(str(a) for a in args)
+        for v in _sensitive_vals:
+            if v:
+                s = s.replace(v, "<REDACTED_API_KEY>")
+        logger.info(s)
+    except Exception:
+        _original_print(*args, **kwargs)
+
+builtins.print = _safe_print
+
 def test_long_text_agent():
     print(colored("--- Starting V2 Long Text Agent Test ---", "cyan"))
     

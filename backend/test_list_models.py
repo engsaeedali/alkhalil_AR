@@ -4,6 +4,25 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Route prints to logger and redact API keys
+from utils.logger_config import setup_logger
+import builtins
+logger = setup_logger("test_list_models")
+_original_print = builtins.print
+_sensitive_vals = [os.getenv(k, "") for k in ("DEEPSEEK_API_KEY", "GOOGLE_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY")]
+
+def _safe_print(*args, **kwargs):
+    try:
+        s = " ".join(str(a) for a in args)
+        for v in _sensitive_vals:
+            if v:
+                s = s.replace(v, "<REDACTED_API_KEY>")
+        logger.info(s)
+    except Exception:
+        _original_print(*args, **kwargs)
+
+builtins.print = _safe_print
+
 key = os.getenv("GOOGLE_API_KEY")
 print(f"Using key: {key[:10]}...")
 

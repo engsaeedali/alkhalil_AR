@@ -22,7 +22,10 @@ try:
     from langchain_google_genai import ChatGoogleGenerativeAI
 except ImportError:
     ChatGoogleGenerativeAI = None # prevent crash if dependency fails
-    print("WARNING: ChatGoogleGenerativeAI import failed.")
+    # initialize logger early and warn
+    from utils.logger_config import setup_logger
+    _early_logger = setup_logger("helpers")
+    _early_logger.warning("ChatGoogleGenerativeAI import failed.")
 
 from config.settings import settings
 from .prompts import STYLE_DETECTION_PROMPT, STYLE_INSTRUCTIONS

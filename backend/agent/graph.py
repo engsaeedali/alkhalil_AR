@@ -13,6 +13,9 @@ from .nodes.consolidation import consolidation_agent
 from .nodes.audit import audit_agent
 from .nodes.finalize import finalize_node
 from .edges.routers import should_continue
+from utils.logger_config import setup_logger
+
+logger = setup_logger("agent.graph")
 
 workflow = StateGraph(AgentState)
 
@@ -48,15 +51,13 @@ app_graph = workflow.compile()
 
 # دالة اختبارية للتحقق من سلامة التجميع (Dry Run) بناءً على توجيهات المستشار التقني
 if __name__ == "__main__":
-    print("📡 Running Dry Run verification for LangGraph Orchestration...")
+    logger.info("📡 Running Dry Run verification for LangGraph Orchestration...")
     try:
         if app_graph is not None:
-            print("✅ Success: LangGraph compiled successfully without config or import errors!")
+            logger.info("✅ Success: LangGraph compiled successfully without config or import errors!")
         else:
-            print("❌ Failure: app_graph is None.")
+            logger.error("❌ Failure: app_graph is None.")
             exit(1)
     except Exception as e:
-        print(f"❌ Failure during compilation: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.exception(f"❌ Failure during compilation: {e}")
         exit(1)

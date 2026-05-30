@@ -56,4 +56,4 @@ if __name__ == "__main__":
     test_drop_literal_duplicate_titles()
     test_sanitize_card_pass_through()
     test_intra_card_warnings_only()
-    print("OK card deduplication v4.2")
+    print("OK card deduplication v4.5")

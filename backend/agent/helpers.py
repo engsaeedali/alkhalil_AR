@@ -128,10 +128,18 @@ def get_llm(provider: Optional[str] = None):
          llm = ChatAnthropic(model="claude-3-5-sonnet-20240620", temperature=0.7)
          return llm, "Claude 3.5 Sonnet"
     
-    # Priority 4: OpenAI
-    logger.info("Fallback to OpenAI Model")
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.7)
-    return llm, "GPT-4o"
+    # Priority 4: DeepSeek (v4.5 — لا OpenAI)
+    ds_key = os.getenv("DEEPSEEK_API_KEY")
+    if ds_key:
+        logger.info("Fallback to DeepSeek-V3 Model")
+        llm = ChatOpenAI(
+            openai_api_key=ds_key,
+            openai_api_base="https://api.deepseek.com/v1",
+            model_name="deepseek-chat",
+            temperature=0.7,
+        )
+        return llm, "DeepSeek-V3"
+    raise ValueError("لا يوجد محرك معتمد متاح — فعّل DEEPSEEK_API_KEY أو GOOGLE_API_KEY.")
 
 def split_text_into_chunks(text: str, max_words: int = 1000) -> list[str]:
     """

@@ -689,31 +689,10 @@ async def summarize(request: SummaryRequest):
         force_engine=request.force_engine
     )
     engine_info = get_engine_description(engine)
-    logger.info(f"🎯 إطلاق المحرك السيادي المختار: {engine_info['name']}")
+    logger.info(f"🎯 إطلاق المحرك السيادي v4.5: {engine_info['name']}")
 
-    # معالجة النصوص القصيرة جداً محلياً تلافياً لهدر الموارد والوقت
-    if engine == "local_hybrid":
-        summary_result = ArabicExtractiveSummarizer.summarize(text=request.text, compression_ratio=request.ratio)
-        keywords = ArabicExtractiveSummarizer.extract_keywords(request.text, top_k=5)
-        numerical_ledger = ArabicExtractiveSummarizer.extract_numbers(request.text)
-        
-        raw_summary = summary_result.get("summary", "")
-        sentences = [s.strip() for s in raw_summary.split(".") if len(s.strip()) > 15]
-        core_ideas = [{"id": i + 1, "idea": sent} for i, sent in enumerate(sentences[:5])]
-        
-        metadata = {
-            "processing_tier": "extractive_hybrid_free",
-            "engine": engine,
-            "engine_description": engine_info["name"],
-            "tokens_consumed": 0,
-            "original_sentences": summary_result["_metadata"].get("original_sentences", 0),
-            "ideas_extracted": len(core_ideas)
-        }
-        return JSONResponse(status_code=200, content=build_khalil_summary_response(core_ideas, numerical_ledger, keywords, metadata, request.format))
-
-    # المعالجة الدلالية الفصيحة للكتب والمخطوطات عبر الـ LLMs
     max_ideas = 20 if text_length > 15000 else 5
-    
+
     try:
         llm = get_llm_client(engine)
 
@@ -734,7 +713,7 @@ async def summarize(request: SummaryRequest):
         original_sentences_count = len(all_sentences)
         
         metadata = {
-            "processing_tier": "llm_generative_premium",
+            "processing_tier": "llm_generative_v4.5",
             "engine": engine,
             "engine_description": engine_info["name"],
             "tokens_consumed": tokens_consumed,
@@ -745,7 +724,7 @@ async def summarize(request: SummaryRequest):
             "text_characters": text_length,
             "chunks_processed": len(text_chunks),
             "map_reduce": len(text_chunks) > 1,
-            "clustering": "semantic_parser_v4.2",
+            "clustering": "semantic_parser_v4.5",
         }
         
         final_response = build_khalil_summary_response(

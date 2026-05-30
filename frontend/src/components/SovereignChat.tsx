@@ -45,6 +45,17 @@ const getApiUrl = (): string => {
 
 const API_BASE_URL = getApiUrl();
 
+type OperationMode = "edit" | "summarize" | "consolidate";
+
+const TASK_LOADING_PRIMARY: Record<OperationMode, string> = {
+  summarize: "🔄 جاري تلخيص النص وحصر الأفكار الكبرى...",
+  edit: "🔄 جاري إعادة صياغة النص وتحسين الحبكة اللغوية...",
+  consolidate: "🔄 جاري تجميع الأفكار الرئيسية وسبك المسودات لغوياً...",
+};
+
+/** منظرة النص v4.5 — خط مكبر للقراءة */
+const VIEWPORT_TEXT = "text-[20px] leading-relaxed";
+
 interface Message {
   id: string;
   role: "user" | "assistant";
@@ -449,9 +460,9 @@ export default function SovereignChat() {
 
     try {
       const logs = [
-        "جاري قراءة المخطوطة وتحليل بنيتها...",
-        "جاري استخلاص الأفكار الجوهرية والكشاف الرقمي...",
-        "جاري صياغة التلخيص الدلالي..."
+        TASK_LOADING_PRIMARY.summarize,
+        "جاري تحليل الفصول عبر Parser العنقودي...",
+        "جاري صهر الأفكار في استدعاءات Map-Reduce..."
       ];
       setMergeLogs([logs[0]]);
       let logCounter = 1;
@@ -472,7 +483,7 @@ export default function SovereignChat() {
         body: JSON.stringify({
           text: primaryText,
           format: summaryFormat,
-          force_engine: engine === "local_hybrid" ? undefined : engine,
+          force_engine: engine,
           user_tier: "premium",
         }),
       });
@@ -546,6 +557,7 @@ export default function SovereignChat() {
 
     try {
       const logs = [
+        TASK_LOADING_PRIMARY.consolidate,
         "جاري تحليل الفوضى البنائية داخل المخطوطة...",
         "جاري التجميع العنقودي وربط الشظايا بالمحاور...",
         "جاري الصهر الأسلوبي الديناميكي وعكس الهندسة الدلالية...",
@@ -791,7 +803,7 @@ export default function SovereignChat() {
             </div>
             <div className="flex flex-col right-alignment select-none">
               <h1 className="text-xl font-black text-transparent bg-clip-text bg-gradient-to-r from-amber-400 via-emerald-100 to-amber-200">
-                مدونة الخليل للتحرير اللغوي <span className="text-xs font-normal text-amber-500/70 font-mono">v2.1</span>
+                مدونة الخليل للتحرير اللغوي <span className="text-xs font-normal text-amber-500/70 font-mono">v4.5 SaaS</span>
               </h1>
               <p className="text-xs text-slate-400 mt-1 font-medium max-w-xl">
                 مساعدك اللغوي لسبك الأفكار، دمج المسودات، والارتقاء بالمحتوى اللغوي بكفاءة بنائية و زمنية.
@@ -1351,14 +1363,10 @@ export default function SovereignChat() {
                   </div>
 
                   <div className="text-center space-y-1">
-                    <h4 className="text-xs font-bold text-white font-sans">
+                    <h4 className={cn("font-bold text-white font-sans", VIEWPORT_TEXT)}>
                       {processPhase === "preflight"
                         ? "جاري فحص اتصال الخوادم..."
-                        : operationMode === "summarize"
-                          ? "جاري التلخيص الدلالي..."
-                          : operationMode === "consolidate"
-                            ? "جاري صهر المحاور..."
-                            : "جاري صياغة النص الهجين"}
+                        : TASK_LOADING_PRIMARY[operationMode]}
                     </h4>
                     <p className="text-[9px] text-slate-500 font-sans">
                       {processPhase === "preflight"
@@ -1761,19 +1769,15 @@ export default function SovereignChat() {
                       <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-full text-amber-500 animate-pulse">
                         <Cpu size={24} />
                       </div>
-                      <h4 className="text-sm font-bold text-white">
-                        {operationMode === "summarize"
-                          ? "جاري التلخيص الدلالي للمخطوطة"
-                          : operationMode === "consolidate"
-                            ? "جاري صهر المحاور واستخلاص البطاقات"
-                            : "جاري سبك وتوحيد النصوص عبر المحرك اللغوي الذكي"}
+                      <h4 className={cn("font-bold text-white", VIEWPORT_TEXT)}>
+                        {TASK_LOADING_PRIMARY[operationMode]}
                       </h4>
-                      <p className="text-xs text-slate-500 max-w-sm leading-relaxed">
+                      <p className={cn("text-slate-500 max-w-sm text-justify font-medium", VIEWPORT_TEXT)}>
                         {operationMode === "summarize"
-                          ? "استدعاء LLM واحد تقريباً — يرجى الانتظار."
+                          ? "Map-Reduce عنقودي — كل فصل يُعالج مستقلاً."
                           : operationMode === "consolidate"
-                            ? "معالجة المحاور السبعة وفق ملف الأصل المرجعي."
-                            : "الرجاء الانتظار، يتم حالياً تحليل الفروق، مطابقة الأفكار وتوليف المخطوطة اللغوية النهائية."}
+                            ? "صهر المحاور السبعة وفق ملف الأصل المرجعي."
+                            : "مطابقة الأفكار وسبك المسودات في استدعاء واحد."}
                       </p>
                     </div>
                   )}
@@ -1782,7 +1786,7 @@ export default function SovereignChat() {
                     value={primaryText}
                     onChange={(e) => setPrimaryText(e.target.value)}
                     disabled={processPhase === "processing" || processPhase === "preflight" || primaryFile.status !== "success"}
-                    className="w-full flex-1 bg-transparent border-0 focus:ring-0 focus:outline-none text-slate-300 leading-relaxed text-justify font-sans text-sm resize-none"
+                    className={cn("w-full flex-1 bg-transparent border-0 focus:ring-0 focus:outline-none text-slate-300 text-justify font-sans resize-none", VIEWPORT_TEXT)}
                     placeholder="اكتب أو هذّب النص المرجعي الأساسي هنا..."
                   />
                 </div>
@@ -1902,6 +1906,30 @@ export default function SovereignChat() {
               ) : (
                 summaryResult && (
                   <div className="space-y-6 pb-12 select-text">
+                    {/* 0. Editorial suggestions v4.5 */}
+                    {(
+                      summaryResult._metadata?.editorial_suggestions ||
+                      summaryResult._metadata?.audit_warnings ||
+                      []
+                    ).length > 0 && (
+                      <div className="bg-amber-950/25 p-5 rounded-2xl border border-amber-500/35 space-y-3">
+                        <h4 className={cn("font-bold text-amber-400 flex items-center gap-2", VIEWPORT_TEXT)}>
+                          <AlertTriangle size={18} />
+                          <span>إرشادات التدقيق التحريري</span>
+                        </h4>
+                        <ul className="space-y-2">
+                          {(summaryResult._metadata?.editorial_suggestions ||
+                            summaryResult._metadata?.audit_warnings ||
+                            []
+                          ).map((tip: string, i: number) => (
+                            <li key={i} className={cn("text-amber-200/90 text-justify pr-2", VIEWPORT_TEXT)}>
+                              • {tip}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+
                     {/* 1. Sovereign Keywords Row */}
                     <div className="bg-slate-900/60 p-5 rounded-2xl border border-slate-850 space-y-3">
                       <h4 className="text-xs font-bold text-amber-400 flex items-center gap-1.5">
@@ -1952,17 +1980,17 @@ export default function SovereignChat() {
                                 {idea.section_title && (
                                   <p className="text-[10px] font-bold text-amber-500/80">{idea.section_title}</p>
                                 )}
-                                <p className="text-xs text-slate-300 leading-relaxed">{idea.sovereign_idea || idea.idea}</p>
+                                <p className={cn("text-slate-300 text-justify", VIEWPORT_TEXT)}>{idea.sovereign_idea || idea.idea}</p>
                               </div>
                             </div>
                             {idea.layers?.practical_applications && (
-                              <p className="text-[10px] text-slate-500 pr-8 leading-relaxed">
-                                <span className="text-slate-400 font-bold">التطبيقات: </span>{idea.layers.practical_applications}
+                              <p className={cn("text-slate-400 pr-8 text-justify", VIEWPORT_TEXT)}>
+                                <span className="text-slate-300 font-bold">التطبيقات: </span>{idea.layers.practical_applications}
                               </p>
                             )}
                             {idea.layers?.conceptual_framework && (
-                              <p className="text-[10px] text-slate-500 pr-8 leading-relaxed">
-                                <span className="text-slate-400 font-bold">الإطار: </span>{idea.layers.conceptual_framework}
+                              <p className={cn("text-slate-400 pr-8 text-justify", VIEWPORT_TEXT)}>
+                                <span className="text-slate-300 font-bold">الإطار: </span>{idea.layers.conceptual_framework}
                               </p>
                             )}
                             {idea.discovered_styles?.length > 0 && (

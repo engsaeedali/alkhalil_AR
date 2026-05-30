@@ -1,46 +1,30 @@
 # -*- coding: utf-8 -*-
+"""v4.5 — محركان سحابيان حصرياً: DeepSeek-V3 | Gemini Flash."""
 
-import os
-import re
 from typing import Literal, Optional
 
-EngineType = Literal["deepseek", "gemini", "local_hybrid"]
-
-MIN_TEXT_FOR_LOCAL = int(os.getenv("MIN_TEXT_FOR_LOCAL", "500"))
-
-_ALLOWED_CLOUD = frozenset({"deepseek", "gemini"})
+EngineType = Literal["deepseek", "gemini"]
 
 
 def choose_summarizer_engine(
     user_tier: str,
     text_length: int,
     text: str,
-    force_engine: Optional[str] = None
+    force_engine: Optional[str] = None,
 ) -> EngineType:
-    """محدد المحرك v4.2 — DeepSeek-V3 أو Gemini Flash حصرياً."""
+    """توجيه حصري للمحركات التوليدية — بلا مسار extractive محلي."""
 
-    if force_engine == "openai":
+    if force_engine in ("openai", "local_hybrid"):
         force_engine = "deepseek"
 
-    if force_engine in _ALLOWED_CLOUD:
-        return force_engine  # type: ignore[return-value]
-
-    if force_engine == "local_hybrid" and text_length >= MIN_TEXT_FOR_LOCAL:
-        return "deepseek"
-
-    if force_engine == "local_hybrid":
-        return "local_hybrid"
-
-    if text_length < MIN_TEXT_FOR_LOCAL:
-        return "local_hybrid"
-
+    if force_engine == "gemini":
+        return "gemini"
     return "deepseek"
 
 
 def get_engine_description(engine: EngineType) -> dict:
     descriptions = {
-        "deepseek": {"name": "DeepSeek-V3 Engine (التوليد اللغوي البليغ)", "tier": "premium"},
-        "gemini": {"name": "Google Gemini Flash (السرعة والتحليل الموسع)", "tier": "premium"},
-        "local_hybrid": {"name": "المحرك المحلي التقليدي (مخصص للنصوص القصيرة جداً)", "tier": "free"},
+        "deepseek": {"name": "DeepSeek-V3 (سبك بلاغي معهود)", "tier": "premium"},
+        "gemini": {"name": "Google Gemini Flash (تحليل سريع موسع)", "tier": "premium"},
     }
-    return descriptions.get(engine, descriptions["local_hybrid"])
+    return descriptions.get(engine, descriptions["deepseek"])

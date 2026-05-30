@@ -14,7 +14,7 @@ from processors.json_document_parser import (
     extract_canonical_axes_from_reference,
     parse_doc_json_payload,
 )
-from processors.consolidation_audit import audit_consolidated_output, calculate_cosine_similarity
+from processors.consolidation_audit import audit_consolidated_output
 
 
 def test_canonical_clustering():
@@ -76,21 +76,28 @@ def test_audit_pass_and_fail():
             "numerical_ledger": [{"value": "7", "context": "عدد المحاور"}],
         }
     }
-    passed, issues = audit_consolidated_output(good)
-    assert passed, issues
+    passed, critical, editorial = audit_consolidated_output(good)
+    assert passed, critical
 
     bad = good.copy()
     bad["discovered_structure"] = dict(good["discovered_structure"])
     bad["discovered_structure"]["sovereign_keywords"] = ["لا", "بل", "منهجية"]
-    passed2, _ = audit_consolidated_output(bad)
+    passed2, critical2, _ = audit_consolidated_output(bad)
     assert not passed2
 
-    sim = calculate_cosine_similarity(
-        "إن التخطيط الاستراتيجي يحمي المشاريع",
-        "إن التخطيط الاستراتيجي يحمي المشاريع الكبرى",
-    )
-    assert sim > 0.5
-    print("OK Audit layer")
+    dup = {
+        "discovered_structure": {
+            "core_ideas": [
+                {"id": 1, "sovereign_idea": "إن التخطيط الاستراتيجي يحمي المشاريع من الانهيار."},
+                {"id": 2, "sovereign_idea": "إن التخطيط الاستراتيجي يحمي المشاريع من الانهيار."},
+            ],
+            "sovereign_keywords": ["التخطيط", "الاستراتيجية", "المشاريع", "الحماية", "النجاح"],
+            "numerical_ledger": [],
+        }
+    }
+    _, _, editorial_dup = audit_consolidated_output(dup)
+    assert any("تكرار حرفي" in e for e in editorial_dup)
+    print("OK Audit layer v4.5")
 
 
 def test_sovereign_keywords_quality():

@@ -349,12 +349,13 @@ class ConsolidationEngine:
         }
 
         output = {"discovered_structure": discovered_structure}
-        passed, issues = audit_consolidated_output(output)
+        passed, critical, editorial = audit_consolidated_output(output)
 
         discovered_structure["_metadata"]["audit_passed"] = passed
-        if issues:
-            discovered_structure["_metadata"]["audit_issues"] = issues
-            discovered_structure["_metadata"]["audit_warnings"] = issues
+        discovered_structure["_metadata"]["audit_issues"] = critical
+        discovered_structure["_metadata"]["editorial_suggestions"] = editorial
+        if editorial:
+            discovered_structure["_metadata"]["audit_warnings"] = editorial
 
         return output
 

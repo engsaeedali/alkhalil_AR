@@ -254,14 +254,37 @@ def cluster_by_canonical_axes(
     return clusters
 
 
-def _token_set(text: str) -> set:
-    return set(ArabicExtractiveSummarizer._clean_and_tokenize(text))
+def assign_orphan_paragraphs(
+    blocks: List[DocumentBlock],
+    clusters: List[SemanticCluster],
+) -> List[SemanticCluster]:
+    """إعادة توزيع الفقرات اليتيمة حسب ترتيب المستند — بلا تشابه حسابي."""
+    assigned_indices = set()
+    for cluster in clusters:
+        for block in blocks:
+            if block.text in cluster.paragraphs:
+                assigned_indices.add(block.index)
 
+    orphans = [b for b in blocks if b.index not in assigned_indices and len(b.text.strip()) > 30]
+    if not orphans or not clusters:
+        return clusters
 
-def _jaccard(a: set, b: set) -> float:
-    if not a or not b:
-        return 0.0
-    return len(a & b) / len(a | b)
+    block_to_cluster: Dict[int, int] = {}
+    for ci, cluster in enumerate(clusters):
+        for block in blocks:
+            if block.text in cluster.paragraphs:
+                block_to_cluster[block.index] = ci
+
+    for orphan in orphans:
+        target = 0
+        for idx in sorted(block_to_cluster.keys()):
+            if idx < orphan.index:
+                target = block_to_cluster[idx]
+            else:
+                break
+        clusters[target].paragraphs.append(orphan.text)
+        block_to_cluster[orphan.index] = target
+    return clusters
 
 
 def cluster_by_dynamic_salience(blocks: List[DocumentBlock], target_clusters: int = 7) -> List[SemanticCluster]:
@@ -271,7 +294,6 @@ def cluster_by_dynamic_salience(blocks: List[DocumentBlock], target_clusters: in
         if _is_heading_candidate(block.text):
             headings.append((block.index, block.text.strip()))
 
-    # كثرة العناوين الزائفة (مثل قصة المحاور المكررة) → لا نُنشئ عنقوداً لكل سطر
     if 3 <= len(headings) <= 12:
         clusters: List[SemanticCluster] = []
         for i, (start_idx, title) in enumerate(headings):
@@ -305,34 +327,6 @@ def cluster_by_dynamic_salience(blocks: List[DocumentBlock], target_clusters: in
             continue
         title = chunk[0][:100] + ("…" if len(chunk[0]) > 100 else "")
         clusters.append(SemanticCluster(id=i + 1, title=title, paragraphs=chunk, source="salience"))
-    return clusters
-
-
-def assign_orphan_paragraphs(
-    blocks: List[DocumentBlock],
-    clusters: List[SemanticCluster],
-) -> List[SemanticCluster]:
-    """إعادة توزيع الفقرات غير المربوطة وفق التشابه المعجمي."""
-    assigned_indices = set()
-    for cluster in clusters:
-        for block in blocks:
-            if block.text in cluster.paragraphs:
-                assigned_indices.add(block.index)
-
-    orphans = [b for b in blocks if b.index not in assigned_indices and len(b.text.strip()) > 30]
-    if not orphans or not clusters:
-        return clusters
-
-    for orphan in orphans:
-        o_tokens = _token_set(orphan.text)
-        best_idx = 0
-        best_score = -1.0
-        for idx, cluster in enumerate(clusters):
-            score = _jaccard(o_tokens, _token_set(cluster.combined_text[:2000]))
-            if score > best_score:
-                best_score = score
-                best_idx = idx
-        clusters[best_idx].paragraphs.append(orphan.text)
     return clusters
 
 

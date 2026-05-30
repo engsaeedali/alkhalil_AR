@@ -124,11 +124,18 @@ export default function SovereignChat() {
   const [viewMode, setViewMode] = useState<string>("split"); // "split", "preview", "json"
   
   // Summarizer states
-  const [operationMode, setOperationMode] = useState<"edit" | "summarize">("edit");
-  const [summaryRatio, setSummaryRatio] = useState<number>(0.3);
+  const [operationMode, setOperationMode] = useState<"edit" | "summarize" | "consolidate">("summarize");
   const [summaryFormat, setSummaryFormat] = useState<"json" | "markdown">("json");
   const [forceEngine, setForceEngine] = useState<string>("auto");
+  const [referenceJson, setReferenceJson] = useState<string>("");
   const [summaryResult, setSummaryResult] = useState<any>(null);
+  const [consolidationTokenUsage, setConsolidationTokenUsage] = useState<{
+    input_tokens?: number;
+    output_tokens?: number;
+    total_tokens?: number;
+    llm_calls?: number;
+    estimated?: boolean;
+  } | null>(null);
   
   const primaryFileInputRef = useRef<HTMLInputElement>(null);
   const auxFileInputRef = useRef<HTMLInputElement>(null);
@@ -136,6 +143,15 @@ export default function SovereignChat() {
   const ideaRefs = useRef<Record<string, HTMLDivElement | null>>({});
 
   const totalTokens = messages.reduce((acc, msg) => acc + (msg.tokenUsage?.total_tokens || 0), 0);
+  const consolidateTokens =
+    consolidationTokenUsage?.total_tokens ??
+    summaryResult?._metadata?.token_usage?.total_tokens ??
+    summaryResult?._metadata?.tokens_consumed ??
+    0;
+  const displayTokenTotal =
+    operationMode === "summarize" || operationMode === "consolidate"
+      ? consolidateTokens
+      : totalTokens;
 
   // حساب حجم الكلمات المدخلة ديناميكياً
   const primaryWords = primaryText.trim() ? primaryText.trim().split(/\s+/).filter(Boolean).length : 0;
@@ -210,19 +226,25 @@ export default function SovereignChat() {
     };
   }, [selectedProvider]);
 
+  const UPLOAD_ACCEPT = ".docx,.pdf,.txt,.md,.markdown,.json,.rtf";
+  const isAllowedUpload = (name: string) => {
+    const ext = name.slice(name.lastIndexOf(".")).toLowerCase();
+    return [".docx", ".pdf", ".txt", ".md", ".markdown", ".json", ".rtf"].includes(ext);
+  };
+
   // File Upload Handler (distinguishes between Primary and Auxiliary drafts)
   const handleFilesUpload = async (fileList: FileList | File[], isPrimaryUpload: boolean) => {
     const filesArray = Array.from(fileList);
-    const docxFiles = filesArray.filter(f => f.name.endsWith(".docx"));
-    
-    if (docxFiles.length === 0) {
-      alert("يرجى اختيار ملفات بصيغة Word (.docx) فقط.");
+    const acceptedFiles = filesArray.filter(f => isAllowedUpload(f.name));
+
+    if (acceptedFiles.length === 0) {
+      alert("الصيغ المدعومة: Word (.docx)، PDF، نص (.txt)، Markdown (.md)، JSON، RTF");
       return;
     }
 
     if (isPrimaryUpload) {
       // Primary draft: only one allowed
-      const file = docxFiles[0];
+      const file = acceptedFiles[0];
       const fileId = Math.random().toString(36).substring(7);
       
       const primaryFileItem = {
@@ -260,12 +282,12 @@ export default function SovereignChat() {
     } else {
       // Auxiliary drafts upload (up to 10 files)
       const currentAuxCount = uploadedFiles.filter(f => !f.isPrimary).length;
-      if (currentAuxCount + docxFiles.length > 10) {
+      if (currentAuxCount + acceptedFiles.length > 10) {
         alert("الحد الأقصى للنصوص الرديفة هو 10 نصوص فقط.");
         return;
       }
 
-      const newFiles = docxFiles.map(file => {
+      const newFiles = acceptedFiles.map(file => {
         const fileId = Math.random().toString(36).substring(7);
         return {
           id: fileId,
@@ -279,7 +301,7 @@ export default function SovereignChat() {
 
       setUploadedFiles(prev => [...prev, ...newFiles]);
 
-      docxFiles.forEach(async (file, index) => {
+      acceptedFiles.forEach(async (file, index) => {
         const correspondingId = newFiles[index].id;
         const formData = new FormData();
         formData.append("file", file);
@@ -412,11 +434,12 @@ export default function SovereignChat() {
 
   const handleSummarize = async () => {
     if (!primaryText.trim()) {
-      alert("يرجى رفع المستند أو كتابة النص أولاً لتفعيل الاستخلاص.");
+      alert("يرجى رفع المستند أو كتابة النص أولاً للتلخيص.");
       return;
     }
 
     setProcessPhase("processing");
+    setConsolidationTokenUsage(null);
     setElapsedTime(0);
     const startTime = Date.now();
     if (timerRef.current) clearInterval(timerRef.current);
@@ -426,10 +449,107 @@ export default function SovereignChat() {
 
     try {
       const logs = [
-        "جاري فحص النص المرجعي المستهدف...",
-        "جاري استدعاء محرك التلخيص الهجين الذكي لفرز الجمل...",
-        "جاري استخلاص الكشاف الرقمي والتواريخ مع الحفاظ على هوامش السياق...",
-        "جاري استخراج الكلمات المفتاحية السيادية وتوليد التقرير النهائي..."
+        "جاري قراءة المخطوطة وتحليل بنيتها...",
+        "جاري استخلاص الأفكار الجوهرية والكشاف الرقمي...",
+        "جاري صياغة التلخيص الدلالي..."
+      ];
+      setMergeLogs([logs[0]]);
+      let logCounter = 1;
+      const logInterval = setInterval(() => {
+        if (logCounter < logs.length) {
+          setMergeLogs((curr) => [...curr, logs[logCounter]]);
+          logCounter++;
+        } else {
+          clearInterval(logInterval);
+        }
+      }, 1800);
+
+      const engine = forceEngine === "auto" ? selectedProvider : forceEngine;
+
+      const res = await fetch(`${API_BASE_URL}/summarize`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text: primaryText,
+          format: summaryFormat,
+          force_engine: engine === "local_hybrid" ? undefined : engine,
+          user_tier: "premium",
+        }),
+      });
+
+      clearInterval(logInterval);
+
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.detail || "فشل طلب التلخيص من الخادم.");
+      }
+
+      const data = await res.json();
+      setMergeLogs(logs);
+      const analytics = data.summary_analytics || data.discovered_structure || data;
+      const meta = analytics._metadata || {};
+      const usage = meta.token_usage
+        ? {
+            input_tokens: Number(meta.token_usage.input_tokens ?? 0),
+            output_tokens: Number(meta.token_usage.output_tokens ?? 0),
+            total_tokens: Number(meta.token_usage.total_tokens ?? meta.tokens_consumed ?? 0),
+            llm_calls: meta.token_usage.llm_calls ?? 1,
+            estimated: Boolean(meta.token_usage.estimated),
+          }
+        : meta.tokens_consumed
+          ? { total_tokens: Number(meta.tokens_consumed), llm_calls: 1 }
+          : null;
+
+      if (analytics && usage) {
+        analytics._metadata = { ...meta, token_usage: usage, tokens_consumed: usage.total_tokens };
+      }
+      setSummaryResult(analytics);
+      setConsolidationTokenUsage(usage);
+      setProcessPhase("completed");
+
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+    } catch (error: any) {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+      console.error("Summarize error:", error);
+      alert(error.message || "حدث خطأ أثناء التلخيص.");
+      setProcessPhase("idle");
+    }
+  };
+
+  const handleConsolidate = async () => {
+    if (!primaryText.trim()) {
+      alert("يرجى رفع المستند أو كتابة النص أولاً لتفعيل الصهر الديناميكي.");
+      return;
+    }
+    if (!referenceJson.trim()) {
+      alert(
+        "مسار الصهر v4.0 يتطلب رفع ملف الأصل JSON (أصل منهجية المحاور السبعة). " +
+        "بدونه يُنشئ النظام عناقيد زائفة ويستهلك مئات آلاف التوكنات بلا بطاقات."
+      );
+      return;
+    }
+
+    setProcessPhase("processing");
+    setConsolidationTokenUsage(null);
+    setElapsedTime(0);
+    const startTime = Date.now();
+    if (timerRef.current) clearInterval(timerRef.current);
+    timerRef.current = setInterval(() => {
+      setElapsedTime(Date.now() - startTime);
+    }, 10);
+
+    try {
+      const logs = [
+        "جاري تحليل الفوضى البنائية داخل المخطوطة...",
+        "جاري التجميع العنقودي وربط الشظايا بالمحاور...",
+        "جاري الصهر الأسلوبي الديناميكي وعكس الهندسة الدلالية...",
+        "جاري التدقيق الآلي وإنتاج البطاقات السيادية..."
       ];
       setMergeLogs([logs[0]]);
       let logCounter = 1;
@@ -440,19 +560,19 @@ export default function SovereignChat() {
         } else {
           clearInterval(logInterval);
         }
-      }, 1500);
+      }, 2000);
 
-      const res = await fetch(`${API_BASE_URL}/summarize`, {
+      const engine = forceEngine === "auto" ? selectedProvider : forceEngine;
+
+      const res = await fetch(`${API_BASE_URL}/consolidate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           text: primaryText,
-          user_tier: "free",
-          ratio: summaryRatio,
+          reference_json: referenceJson.trim() || undefined,
           format: summaryFormat,
-          force_engine: forceEngine === "auto" 
-            ? (primaryText.length < 500 ? "local_hybrid" : selectedProvider) 
-            : forceEngine
+          force_engine: engine === "local_hybrid" ? "deepseek" : engine,
+          custom_intent: customIntent.trim() || undefined,
         })
       });
 
@@ -460,15 +580,38 @@ export default function SovereignChat() {
 
       if (!res.ok) {
         const errorData = await res.json().catch(() => ({}));
-        throw new Error(errorData.detail || "فشل طلب التلخيص من الخادم الرئيسي.");
+        throw new Error(errorData.detail || "فشل طلب الصهر الديناميكي من الخادم.");
       }
 
       const data = await res.json();
-      
-      // Complete logs simulation
       setMergeLogs(logs);
-
-      setSummaryResult(data.summary_analytics);
+      const discovered = data.discovered_structure || data.summary_analytics;
+      const rawUsage =
+        data.token_usage ||
+        discovered?._metadata?.token_usage ||
+        (discovered?._metadata?.tokens_consumed
+          ? { total_tokens: discovered._metadata.tokens_consumed }
+          : null);
+      const usage = rawUsage
+        ? {
+            input_tokens: Number(rawUsage.input_tokens ?? 0),
+            output_tokens: Number(rawUsage.output_tokens ?? 0),
+            total_tokens: Number(
+              rawUsage.total_tokens ?? discovered?._metadata?.tokens_consumed ?? 0
+            ),
+            llm_calls: rawUsage.llm_calls ?? undefined,
+            estimated: Boolean(rawUsage.estimated),
+          }
+        : null;
+      if (discovered && usage) {
+        discovered._metadata = {
+          ...(discovered._metadata || {}),
+          token_usage: usage,
+          tokens_consumed: usage.total_tokens,
+        };
+      }
+      setSummaryResult(discovered);
+      setConsolidationTokenUsage(usage);
       setProcessPhase("completed");
 
       if (timerRef.current) {
@@ -481,8 +624,8 @@ export default function SovereignChat() {
         clearInterval(timerRef.current);
         timerRef.current = null;
       }
-      console.error("Summarization error:", error);
-      alert(error.message || "حدث خطأ غير متوقع أثناء معالجة التلخيص.");
+      console.error("Consolidation error:", error);
+      alert(error.message || "حدث خطأ غير متوقع أثناء الصهر الديناميكي.");
       setProcessPhase("idle");
     }
   };
@@ -507,6 +650,41 @@ export default function SovereignChat() {
     document.body.removeChild(element);
   };
 
+  const handleDownloadDocx = async () => {
+    if (!summaryResult) {
+      alert("لا توجد نتائج للتصدير. نفّذ الصهر أولاً.");
+      return;
+    }
+    try {
+      const res = await fetch(`${API_BASE_URL}/export/docx`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          discovered_structure: summaryResult,
+          title: "جوهر المخطوطة — مدونة الخليل",
+          source_filename: primaryFile?.name || undefined,
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || "فشل تصدير Word");
+      }
+      const blob = await res.blob();
+      const stamp = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "");
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `khalil_consolidation_${stamp}.docx`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (error: any) {
+      console.error("DOCX export error:", error);
+      alert(error.message || "تعذر تصدير مستند Word.");
+    }
+  };
+
   const handleNewChat = () => {
     if (window.confirm("هل أنت متأكد من بدء جلسة جديدة؟ سيتم مسح جميع الملفات والبيانات الحالية.")) {
       if (timerRef.current) {
@@ -525,6 +703,8 @@ export default function SovereignChat() {
       setCustomIntent("");
       setPreflightError(null);
       setPreflightSuccess(null);
+      setSummaryResult(null);
+      setConsolidationTokenUsage(null);
     }
   };
 
@@ -660,10 +840,17 @@ export default function SovereignChat() {
         </div>
 
         <div className="flex items-center gap-4">
-          {totalTokens > 0 && (
+          {(displayTokenTotal > 0 ||
+            ((operationMode === "summarize" || operationMode === "consolidate") &&
+              processPhase === "completed")) && (
             <div className="flex items-center gap-2 text-xs font-mono text-amber-400/80 bg-amber-500/5 px-3 py-1 rounded-full border border-amber-500/15">
               <Activity size={12} className="text-[#f59e0b]" />
-              <span>{totalTokens.toLocaleString()} TKN</span>
+              <span>
+                {displayTokenTotal.toLocaleString()} TKN
+                {consolidationTokenUsage?.estimated && (
+                  <span className="text-[9px] text-slate-500 mr-1"> (تقدير)</span>
+                )}
+              </span>
             </div>
           )}
 
@@ -804,13 +991,13 @@ export default function SovereignChat() {
                             if (e.target.files) handleFilesUpload(e.target.files, true);
                             e.target.value = "";
                           }}
-                          accept=".docx"
+                          accept={UPLOAD_ACCEPT}
                           className="hidden"
                         />
                         <UploadCloud size={24} className="text-amber-500/70 group-hover:scale-105 transition-transform" />
                         <div className="text-center">
                           <p className="text-xs font-bold text-slate-300">إيداع النص المرجعي الأساسي</p>
-                          <p className="text-[9px] text-slate-500 mt-1">يستخدم كركيزة لصياغة النص (.docx فقط)</p>
+                          <p className="text-[9px] text-slate-500 mt-1 leading-relaxed">docx · pdf · txt · md · json · rtf</p>
                         </div>
                       </div>
                     ) : (
@@ -852,11 +1039,22 @@ export default function SovereignChat() {
                   {isPrimaryLoaded && (
                     <div className="space-y-4 pt-1 border-t border-slate-800">
                       <span className="text-[11px] font-bold text-amber-500 block font-sans">اختر نوع العملية</span>
-                      <div className="grid grid-cols-2 gap-1.5 bg-slate-900 p-0.5 rounded-xl border border-slate-800">
+                      <div className="grid grid-cols-3 gap-1 bg-slate-900 p-0.5 rounded-xl border border-slate-800">
+                        <button
+                          onClick={() => setOperationMode("summarize")}
+                          className={cn(
+                            "py-1.5 rounded-lg text-[9px] font-bold text-center transition-all duration-300 cursor-pointer leading-snug",
+                            operationMode === "summarize"
+                              ? "bg-amber-950/40 text-amber-500 border border-amber-500/30 ring-1 ring-amber-500/30 shadow-md font-black"
+                              : "text-slate-500 hover:text-slate-300 hover:scale-[1.02]"
+                          )}
+                        >
+                          تلخيص دلالي
+                        </button>
                         <button
                           onClick={() => setOperationMode("edit")}
                           className={cn(
-                            "py-1.5 rounded-lg text-[10px] font-bold text-center transition-all duration-300 cursor-pointer",
+                            "py-1.5 rounded-lg text-[9px] font-bold text-center transition-all duration-300 cursor-pointer leading-snug",
                             operationMode === "edit"
                               ? "bg-amber-950/40 text-amber-500 border border-amber-500/30 ring-1 ring-amber-500/30 shadow-md font-black"
                               : "text-slate-500 hover:text-slate-300 hover:scale-[1.02]"
@@ -865,17 +1063,27 @@ export default function SovereignChat() {
                           تحرير ودمج
                         </button>
                         <button
-                          onClick={() => setOperationMode("summarize")}
+                          onClick={() => setOperationMode("consolidate")}
                           className={cn(
-                            "py-1.5 rounded-lg text-[10px] font-bold text-center transition-all duration-300 cursor-pointer",
-                            operationMode === "summarize"
+                            "py-1.5 rounded-lg text-[9px] font-bold text-center transition-all duration-300 cursor-pointer leading-snug",
+                            operationMode === "consolidate"
                               ? "bg-amber-950/40 text-amber-500 border border-amber-500/30 ring-1 ring-amber-500/30 shadow-md font-black"
                               : "text-slate-500 hover:text-slate-300 hover:scale-[1.02]"
                           )}
                         >
-                          تلخيص واستخلاص
+                          صهر المحاور
                         </button>
                       </div>
+                      {operationMode === "summarize" && (
+                        <p className="text-[9px] text-slate-500 leading-relaxed">
+                          استخلاص أفكار جوهرية وكلمات مفتاحية — استدعاء LLM واحد تقريباً.
+                        </p>
+                      )}
+                      {operationMode === "consolidate" && (
+                        <p className="text-[9px] text-amber-500/80 leading-relaxed">
+                          متقدم: دمج الفوضى في 7 محاور — يتطلب ملف الأصل JSON.
+                        </p>
+                      )}
                     </div>
                   )}
 
@@ -920,14 +1128,14 @@ export default function SovereignChat() {
                                   if (e.target.files) handleFilesUpload(e.target.files, false);
                                   e.target.value = "";
                                 }}
-                                accept=".docx"
+                                accept={UPLOAD_ACCEPT}
                                 multiple
                                 className="hidden"
                               />
                               <Paperclip size={16} className="text-slate-500" />
                               <div className="text-center">
                                 <p className="text-[11px] font-bold text-slate-300">إيداع النصوص الرديفة الإضافية</p>
-                                <p className="text-[8px] text-slate-500 mt-0.5">يمكن رفع حتى 10 مستندات</p>
+                                <p className="text-[8px] text-slate-500 mt-0.5">حتى 10 ملفات — docx · pdf · txt · md · json · rtf</p>
                               </div>
                             </div>
 
@@ -1032,30 +1240,47 @@ export default function SovereignChat() {
                     </>
                   )}
 
-                  {isPrimaryLoaded && operationMode === "summarize" && (
+                  {isPrimaryLoaded && (operationMode === "summarize" || operationMode === "consolidate") && (
                     <div className="space-y-4 pt-4 border-t border-slate-800/40">
-                      {/* Summary Ratio Slider */}
-                      <div className="space-y-2">
-                        <div className="flex justify-between text-[11px] font-bold font-sans">
-                          <span className="text-amber-500">نسبة الاختصار المستهدفة</span>
-                          <span className="font-mono text-slate-300">{Math.round(summaryRatio * 100)}%</span>
-                        </div>
-                        <input
-                          type="range"
-                          min="0.1"
-                          max="0.6"
-                          step="0.05"
-                          value={summaryRatio}
-                          onChange={(e) => setSummaryRatio(parseFloat(e.target.value))}
-                          className="w-full h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-amber-500 focus:outline-none"
-                        />
-                        <div className="flex justify-between text-[8px] text-slate-500 font-mono">
-                          <span>10% (موجز جداً)</span>
-                          <span>60% (تفصيلي)</span>
-                        </div>
-                      </div>
+                      {operationMode === "consolidate" && (
+                        <>
+                          <div className="space-y-1.5">
+                            <span className="text-[11px] font-bold text-amber-500 block font-sans">ملف الأصل المرجعي (JSON — إلزامي)</span>
+                            <input
+                              type="file"
+                              accept=".json"
+                              onChange={async (e) => {
+                                const file = e.target.files?.[0];
+                                if (!file) return;
+                                const text = await file.text();
+                                setReferenceJson(text);
+                                e.target.value = "";
+                              }}
+                              className="w-full text-[10px] text-slate-400 file:mr-2 file:py-1 file:px-2 file:rounded-lg file:border-0 file:bg-amber-950/40 file:text-amber-500 file:font-bold file:cursor-pointer"
+                            />
+                            {referenceJson && (
+                              <p className="text-[9px] text-emerald-400 font-sans">✓ تم تحميل المرجع ({Math.round(referenceJson.length / 1024)} KB)</p>
+                            )}
+                          </div>
+                          <div className="space-y-1.5">
+                            <span className="text-[11px] font-bold text-slate-300 block font-sans">توجيه الصهر (اختياري)</span>
+                            <textarea
+                              value={customIntent}
+                              onChange={(e) => setCustomIntent(e.target.value)}
+                              placeholder="مثال: ركّز على السرد القصصي دون تكرار..."
+                              className="w-full bg-slate-900 border border-slate-800 focus:border-amber-500 focus:ring-1 focus:ring-amber-500/30 rounded-xl p-3 text-right font-sans text-xs text-slate-300 placeholder:text-slate-500 resize-none min-h-[70px] focus:outline-none"
+                            />
+                          </div>
+                        </>
+                      )}
 
-                      {/* Export Format Toggle */}
+                      {operationMode === "summarize" && (
+                        <p className="text-[9px] text-slate-500 leading-relaxed">
+                          استدعاء LLM واحد تقريباً — مناسب للنصوص الطويلة دون ملف مرجعي.
+                        </p>
+                      )}
+
+                      {/* Export Format + Engine — مشترك */}
                       <div className="space-y-1.5 pt-1.5 border-t border-slate-800/40">
                         <span className="text-[11px] font-bold text-slate-300 block font-sans">صيغة المخرجات</span>
                         <div className="grid grid-cols-2 gap-2 bg-slate-900 p-0.5 rounded-xl border border-slate-800">
@@ -1087,10 +1312,9 @@ export default function SovereignChat() {
                       {/* Preferred Engine Toggle */}
                       <div className="space-y-1.5 pt-1.5 border-t border-slate-800/40">
                         <span className="text-[11px] font-bold text-slate-300 block font-sans">تفضيل المحرك</span>
-                        <div className="grid grid-cols-4 gap-1 bg-slate-900 p-0.5 rounded-xl border border-slate-800">
+                        <div className="grid grid-cols-3 gap-1 bg-slate-900 p-0.5 rounded-xl border border-slate-800">
                           {[
                             { id: "auto", label: "تلقائي" },
-                            { id: "local_hybrid", label: "محلي" },
                             { id: "deepseek", label: "DeepSeek" },
                             { id: "gemini", label: "Gemini" }
                           ].map(e => (
@@ -1128,10 +1352,22 @@ export default function SovereignChat() {
 
                   <div className="text-center space-y-1">
                     <h4 className="text-xs font-bold text-white font-sans">
-                      {processPhase === "preflight" ? "جاري فحص اتصال الخوادم..." : "جاري صياغة النص الهجين"}
+                      {processPhase === "preflight"
+                        ? "جاري فحص اتصال الخوادم..."
+                        : operationMode === "summarize"
+                          ? "جاري التلخيص الدلالي..."
+                          : operationMode === "consolidate"
+                            ? "جاري صهر المحاور..."
+                            : "جاري صياغة النص الهجين"}
                     </h4>
                     <p className="text-[9px] text-slate-500 font-sans">
-                      {processPhase === "preflight" ? "يتم التحقق من مفتاح API وصلاحية الحساب" : "يقوم وكلاء الأنظمة بعمليات المطابقة والدراسة..."}
+                      {processPhase === "preflight"
+                        ? "يتم التحقق من مفتاح API وصلاحية الحساب"
+                        : operationMode === "summarize"
+                          ? "استخلاص الأفكار والكلمات المفتاحية في استدعاء واحد..."
+                          : operationMode === "consolidate"
+                            ? "دمج الفوضى البنائية في بطاقات المحاور السبعة..."
+                            : "يقوم وكلاء الأنظمة بعمليات المطابقة والدراسة..."}
                     </p>
                   </div>
 
@@ -1220,34 +1456,125 @@ export default function SovereignChat() {
                         </div>
                       </div>
                     </>
-                  ) : (
-                    // Summarizer Dashboard Metrics
+                  ) : operationMode === "summarize" ? (
                     <>
                       <div className="bg-slate-900 p-3.5 rounded-2xl border border-slate-800 space-y-1.5 shadow-inner">
-                        <span className="text-[9px] text-slate-500 font-bold block">الملف الملخص</span>
+                        <span className="text-[9px] text-slate-500 font-bold block">الملف المُلخَّص</span>
                         <div className="flex items-center justify-between text-[10px]">
                           <span className="text-slate-300 truncate max-w-[170px] font-medium">{primaryFile?.name || "النص المباشر"}</span>
                           <span className="text-[8px] px-1.5 py-0.5 rounded font-bold border bg-emerald-500/10 text-emerald-400 border-emerald-500/25">
-                            مستخلص
+                            تلخيص
                           </span>
                         </div>
                       </div>
 
-                      {/* Dynamic Metrics */}
                       <div className="space-y-2">
-                        <span className="text-[10px] font-bold text-slate-400 block font-sans">مؤشرات الاستخلاص والتلخيص</span>
-                        
+                        <span className="text-[10px] font-bold text-slate-400 block font-sans">مؤشرات التلخيص الدلالي</span>
                         <div className="grid grid-cols-2 gap-2">
+                          <div className="p-3 bg-amber-950/20 border border-amber-500/25 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right col-span-2">
+                            <span className="text-[8px] text-amber-500/80 block mb-0.5 font-bold">إجمالي التوكنات (LLM)</span>
+                            <span className="text-lg font-black text-amber-400 font-mono">
+                              {(
+                                consolidationTokenUsage?.total_tokens ??
+                                summaryResult?._metadata?.token_usage?.total_tokens ??
+                                summaryResult?._metadata?.tokens_consumed ??
+                                0
+                              ).toLocaleString()}
+                            </span>
+                            {(consolidationTokenUsage?.estimated ||
+                              summaryResult?._metadata?.token_usage?.estimated) && (
+                              <span className="text-[8px] text-slate-500 block mt-1">
+                                * تقدير تقريبي — المزود لم يُرجع عداداً دقيقاً
+                              </span>
+                            )}
+                          </div>
                           <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right">
-                            <span className="text-[8px] text-slate-500 block mb-0.5">التوكنات الخارجية</span>
-                            <span className="text-xs font-bold text-amber-500 font-mono">
-                              {summaryResult?._metadata?.tokens_consumed || 0}
+                            <span className="text-[8px] text-slate-500 block mb-0.5">الأفكار الجوهرية</span>
+                            <span className="text-xs font-bold text-emerald-400 font-mono">
+                              {summaryResult?.core_ideas?.length || 0}
                             </span>
                           </div>
                           <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right">
-                            <span className="text-[8px] text-slate-500 block mb-0.5">الجمل: الأصلية vs المستخلصة</span>
+                            <span className="text-[8px] text-slate-500 block mb-0.5">الكلمات المفتاحية</span>
+                            <span className="text-xs font-bold text-[#38bdf8] font-mono">
+                              {summaryResult?.sovereign_keywords?.length || 0}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl text-right">
+                        <span className="text-[8px] text-slate-500 block mb-0.5">محرك التلخيص</span>
+                        <span className="text-xs font-bold text-slate-300 font-sans">
+                          {summaryResult?._metadata?.engine_description || summaryResult?._metadata?.engine_utilized || "—"}
+                        </span>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="bg-slate-900 p-3.5 rounded-2xl border border-slate-800 space-y-1.5 shadow-inner">
+                        <span className="text-[9px] text-slate-500 font-bold block">الملف المُصهَر</span>
+                        <div className="flex items-center justify-between text-[10px]">
+                          <span className="text-slate-300 truncate max-w-[170px] font-medium">{primaryFile?.name || "النص المباشر"}</span>
+                          <span className="text-[8px] px-1.5 py-0.5 rounded font-bold border bg-amber-500/10 text-amber-400 border-amber-500/25">
+                            صهر
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="space-y-2">
+                        <span className="text-[10px] font-bold text-slate-400 block font-sans">مؤشرات الصهر الديناميكي</span>
+
+                        <div className="grid grid-cols-2 gap-2">
+                          <div className="p-3 bg-amber-950/20 border border-amber-500/25 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right col-span-2">
+                            <span className="text-[8px] text-amber-500/80 block mb-0.5 font-bold">إجمالي التوكنات (LLM)</span>
+                            <span className="text-lg font-black text-amber-400 font-mono">
+                              {(
+                                consolidationTokenUsage?.total_tokens ??
+                                summaryResult?._metadata?.token_usage?.total_tokens ??
+                                summaryResult?._metadata?.tokens_consumed ??
+                                0
+                              ).toLocaleString()}
+                            </span>
+                            {((consolidationTokenUsage?.input_tokens ?? 0) > 0 ||
+                              (summaryResult?._metadata?.token_usage?.input_tokens ?? 0) > 0 ||
+                              (consolidationTokenUsage?.llm_calls ?? 0) > 0) && (
+                              <div className="flex justify-between mt-1.5 text-[9px] font-mono text-slate-500">
+                                <span>
+                                  مدخل:{" "}
+                                  {(
+                                    consolidationTokenUsage?.input_tokens ??
+                                    summaryResult?._metadata?.token_usage?.input_tokens ??
+                                    0
+                                  ).toLocaleString()}
+                                </span>
+                                <span>
+                                  مخرج:{" "}
+                                  {(
+                                    consolidationTokenUsage?.output_tokens ??
+                                    summaryResult?._metadata?.token_usage?.output_tokens ??
+                                    0
+                                  ).toLocaleString()}
+                                </span>
+                                <span>
+                                  استدعاءات:{" "}
+                                  {consolidationTokenUsage?.llm_calls ??
+                                    summaryResult?._metadata?.token_usage?.llm_calls ??
+                                    "—"}
+                                </span>
+                              </div>
+                            )}
+                            {(consolidationTokenUsage?.estimated ||
+                              summaryResult?._metadata?.token_usage?.estimated) && (
+                              <span className="text-[8px] text-slate-500 block mt-1">
+                                * تقدير تقريبي — المزود لم يُرجع عداداً دقيقاً
+                              </span>
+                            )}
+                          </div>
+                          <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right">
+                            <span className="text-[8px] text-slate-500 block mb-0.5">البطاقات / العناقيد</span>
                             <span className="text-xs font-bold text-emerald-400 font-mono">
-                              {summaryResult?._metadata?.original_sentences || 0} / {summaryResult?.core_ideas?.length || 0}
+                              {summaryResult?.core_ideas?.length || 0} / {summaryResult?._metadata?.clusters_processed || 0}
                             </span>
                           </div>
                           <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right">
@@ -1266,10 +1593,23 @@ export default function SovereignChat() {
                       </div>
 
                       <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl text-right">
-                        <span className="text-[8px] text-slate-500 block mb-0.5">محرك التلخيص المعتمد</span>
+                        <span className="text-[8px] text-slate-500 block mb-0.5">محرك الصهر المعتمد</span>
                         <span className="text-xs font-bold text-slate-300 font-sans">
-                          {summaryResult?._metadata?.engine_description || "المحرك المحلي الهجين"}
+                          {summaryResult?._metadata?.engine_description || summaryResult?._metadata?.engine_utilized || "DeepSeek v4"}
                         </span>
+                        {summaryResult?._metadata?.audit_passed === false && (
+                          <div className="mt-1.5 space-y-1">
+                            <span className="text-[9px] text-amber-500 block">⚠ تحذيرات تدقيق — راجع المخرجات</span>
+                            {(summaryResult?._metadata?.audit_issues ||
+                              summaryResult?._metadata?.audit_warnings ||
+                              []
+                            ).slice(0, 5).map((issue: string, i: number) => (
+                              <span key={i} className="text-[8px] text-slate-500 block leading-relaxed">
+                                • {issue}
+                              </span>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     </>
                   )}
@@ -1294,6 +1634,7 @@ export default function SovereignChat() {
                         setActiveWorkspaceData(null);
                       } else {
                         setSummaryResult(null);
+                        setConsolidationTokenUsage(null);
                       }
                     }}
                     className="w-full py-2 px-3 border border-amber-500/30 text-amber-500 hover:bg-amber-500/5 hover:scale-[1.02] transition-all duration-300 rounded-xl text-xs font-bold text-center cursor-pointer"
@@ -1310,7 +1651,13 @@ export default function SovereignChat() {
             {processPhase !== "completed" && processPhase !== "processing" && processPhase !== "preflight" && (
               <div className="pt-6 border-t border-slate-800 space-y-3 mt-6">
                 <button
-                  onClick={operationMode === "edit" ? handlePreflightAndMerge : handleSummarize}
+                  onClick={
+                    operationMode === "edit"
+                      ? handlePreflightAndMerge
+                      : operationMode === "summarize"
+                        ? handleSummarize
+                        : handleConsolidate
+                  }
                   disabled={operationMode === "edit" ? (!isReadyToRun || !isProviderReady || checkingProvider) : !isPrimaryLoaded}
                   className={cn(
                     "w-full py-3.5 rounded-xl font-bold text-xs tracking-wide transition-all duration-300 shadow-lg cursor-pointer",
@@ -1326,7 +1673,11 @@ export default function SovereignChat() {
                   <div className="flex items-center justify-center gap-1.5">
                     <Sparkles size={14} />
                     <span>
-                      {operationMode === "edit" ? "بدء السبك الصياغي والدمج الذكي" : "بدء التلخيص واستخلاص الذروة"}
+                      {operationMode === "edit"
+                        ? "بدء السبك الصياغي والدمج الذكي"
+                        : operationMode === "summarize"
+                          ? "بدء التلخيص الدلالي"
+                          : "بدء صهر المحاور السبعة"}
                     </span>
                   </div>
                 </button>
@@ -1410,9 +1761,19 @@ export default function SovereignChat() {
                       <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-full text-amber-500 animate-pulse">
                         <Cpu size={24} />
                       </div>
-                      <h4 className="text-sm font-bold text-white">جاري سبك وتوحيد النصوص عبر المحرك اللغوي الذكي</h4>
+                      <h4 className="text-sm font-bold text-white">
+                        {operationMode === "summarize"
+                          ? "جاري التلخيص الدلالي للمخطوطة"
+                          : operationMode === "consolidate"
+                            ? "جاري صهر المحاور واستخلاص البطاقات"
+                            : "جاري سبك وتوحيد النصوص عبر المحرك اللغوي الذكي"}
+                      </h4>
                       <p className="text-xs text-slate-500 max-w-sm leading-relaxed">
-                        الرجاء الانتظار، يتم حالياً تحليل الفروق، مطابقة الأفكار وتوليف المخطوطة اللغوية النهائية.
+                        {operationMode === "summarize"
+                          ? "استدعاء LLM واحد تقريباً — يرجى الانتظار."
+                          : operationMode === "consolidate"
+                            ? "معالجة المحاور السبعة وفق ملف الأصل المرجعي."
+                            : "الرجاء الانتظار، يتم حالياً تحليل الفروق، مطابقة الأفكار وتوليف المخطوطة اللغوية النهائية."}
                       </p>
                     </div>
                   )}
@@ -1561,11 +1922,17 @@ export default function SovereignChat() {
                       <div className="flex items-center justify-between border-b border-slate-800 pb-2">
                         <h4 className="text-xs font-bold text-amber-400 flex items-center gap-1.5">
                           <Layers size={14} />
-                          <span>💡 الأفكار الجوهرية (مستخلص الذروة)</span>
+                          <span>
+                            {operationMode === "consolidate"
+                              ? "💡 البطاقات المعرفية السيادية"
+                              : "💡 الأفكار الجوهرية"}
+                          </span>
                         </h4>
                         <button
                           onClick={() => {
-                            const ideasText = summaryResult.core_ideas?.map((idea: any) => `${idea.id}. ${idea.idea}`).join("\n");
+                            const ideasText = summaryResult.core_ideas?.map((idea: any) =>
+                              `${idea.id}. ${idea.section_title || ""}\n${idea.sovereign_idea || idea.idea || ""}`
+                            ).join("\n\n");
                             copyToClipboard(ideasText, "summary_ideas_copy");
                           }}
                           className="flex items-center gap-1 text-[10px] text-amber-500 hover:underline cursor-pointer"
@@ -1576,11 +1943,31 @@ export default function SovereignChat() {
                       </div>
                       <div className="space-y-2.5">
                         {summaryResult.core_ideas?.map((idea: any, i: number) => (
-                          <div key={i} className="p-3 bg-slate-950/60 border border-slate-850 rounded-xl flex items-start gap-3">
-                            <span className="w-5 h-5 bg-amber-500/10 text-amber-400 border border-amber-500/20 rounded-lg flex items-center justify-center text-[10px] font-bold font-mono shrink-0 mt-0.5">
-                              {idea.id}
-                            </span>
-                            <p className="text-xs text-slate-300 leading-relaxed">{idea.idea}</p>
+                          <div key={i} className="p-3 bg-slate-950/60 border border-slate-850 rounded-xl space-y-2">
+                            <div className="flex items-start gap-3">
+                              <span className="w-5 h-5 bg-amber-500/10 text-amber-400 border border-amber-500/20 rounded-lg flex items-center justify-center text-[10px] font-bold font-mono shrink-0 mt-0.5">
+                                {idea.id}
+                              </span>
+                              <div className="space-y-1">
+                                {idea.section_title && (
+                                  <p className="text-[10px] font-bold text-amber-500/80">{idea.section_title}</p>
+                                )}
+                                <p className="text-xs text-slate-300 leading-relaxed">{idea.sovereign_idea || idea.idea}</p>
+                              </div>
+                            </div>
+                            {idea.layers?.practical_applications && (
+                              <p className="text-[10px] text-slate-500 pr-8 leading-relaxed">
+                                <span className="text-slate-400 font-bold">التطبيقات: </span>{idea.layers.practical_applications}
+                              </p>
+                            )}
+                            {idea.layers?.conceptual_framework && (
+                              <p className="text-[10px] text-slate-500 pr-8 leading-relaxed">
+                                <span className="text-slate-400 font-bold">الإطار: </span>{idea.layers.conceptual_framework}
+                              </p>
+                            )}
+                            {idea.discovered_styles?.length > 0 && (
+                              <p className="text-[9px] text-slate-600 pr-8">أنماط: {idea.discovered_styles.join(" · ")}</p>
+                            )}
                           </div>
                         ))}
                       </div>
@@ -1676,19 +2063,28 @@ export default function SovereignChat() {
                 </>
               ) : (
                 <>
+                  {operationMode === "consolidate" && (
+                    <button 
+                      onClick={handleDownloadDocx}
+                      className="px-4 py-2 bg-gradient-to-r from-amber-500/90 to-amber-600/90 hover:from-amber-500 hover:to-amber-600 border border-amber-500/40 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all duration-300 cursor-pointer text-black hover:scale-[1.02] shadow-md"
+                    >
+                      <Download size={12} />
+                      <span>تصدير Word منسّق</span>
+                    </button>
+                  )}
                   <button 
                     onClick={() => copyToClipboard(summaryResult.export_content || "", "summary_export_action")}
                     className="px-4 py-2 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all duration-300 cursor-pointer text-slate-200 hover:border-amber-500/30 hover:scale-[1.02]"
                   >
                     {copiedId === "summary_export_action" ? <Check size={12} className="text-emerald-400" /> : <Copy size={12} />}
-                    <span>نسخ مستند التلخيص</span>
+                    <span>نسخ Markdown</span>
                   </button>
                   <button 
                     onClick={() => handleDownload(JSON.stringify(summaryResult, null, 2), "summary_json")}
                     className="px-4 py-2 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all duration-300 cursor-pointer text-slate-200 hover:border-amber-500/30 hover:scale-[1.02]"
                   >
                     <Download size={12} />
-                    <span>تصدير JSON التلخيص</span>
+                    <span>تصدير JSON</span>
                   </button>
                 </>
               )}

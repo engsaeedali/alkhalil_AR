@@ -3,7 +3,7 @@ import sys
 import uuid
 import logging
 import json
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 from contextlib import asynccontextmanager
 
 # 1. تثبيت مسارات النظام لضمان سلامة التجميع (Vercel & Local)
@@ -14,12 +14,20 @@ if current_dir not in sys.path:
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware  
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, validator
 import httpx
 
 from utils.logger_config import setup_logger
+from utils.token_meter import (
+    estimate_tokens,
+    extract_token_usage,
+    extract_tokens_consumed,
+    merge_usage_accumulator,
+)
 from processors.summarizer import ArabicExtractiveSummarizer
+from processors.consolidation_engine import ConsolidationEngine, build_consolidation_export
+from processors.docx_exporter import ConsolidationDocxExporter
 from utils.summary_router import choose_summarizer_engine, get_engine_description, MIN_TEXT_FOR_LOCAL
 from tenacity import retry, stop_after_attempt, wait_exponential
 from langchain_openai import ChatOpenAI
@@ -189,18 +197,58 @@ class PeakExtractionRequest(BaseModel):
             raise ValueError(f"الصيغة {v} غير مدعومة. استخدم json أو markdown")
         return v
 
+class ConsolidateRequest(BaseModel):
+    text: str = Field(..., description="المخطوطة الفوضوية أو JSON Docx")
+    reference_json: Optional[str] = Field(None, description="ملف الأصل المرجعي (JSON) اختياري")
+    format: Optional[str] = Field("json", description="json أو markdown")
+    force_engine: Optional[str] = Field("deepseek", description="deepseek | gemini")
+    custom_intent: Optional[str] = Field(None, description="توجيه مخصص للصهر")
+
+    @validator('text')
+    def validate_text(cls, v):
+        if not v or not v.strip():
+            raise ValueError("عذراً، لا يمكن صهر مخطوطة فارغة.")
+        return v.strip()
+
+    @validator('format')
+    def validate_format(cls, v):
+        if v not in ["json", "markdown"]:
+            raise ValueError(f"الصيغة {v} غير مدعومة. استخدم json أو markdown")
+        return v
+
+class DocxExportRequest(BaseModel):
+    discovered_structure: Dict[str, Any] = Field(..., description="هيكل discovered_structure من /consolidate")
+    title: Optional[str] = Field("جوهر المخطوطة — مدونة الخليل", description="عنوان المستند")
+    source_filename: Optional[str] = Field(None, description="اسم الملف المصدر")
+
+    @validator('discovered_structure')
+    def validate_structure(cls, v):
+        if not v or not isinstance(v, dict):
+            raise ValueError("هيكل المخرجات فارغ أو غير صالح.")
+        if not v.get("core_ideas") and not v.get("export_content"):
+            raise ValueError("لا توجد بطاقات معرفية للتصدير.")
+        return v
+
 # دالة فحص أحجام المستندات المرفوعة
-ALLOWED_EXTENSIONS = {".docx"}
-MAX_FILE_SIZE = 15 * 1024 * 1024  # 15 ميجابايت
+MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 ميجابايت
 
 async def validate_uploaded_file(file: UploadFile) -> bytes:
-    ext = os.path.splitext(file.filename)[1].lower()
-    if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="عذراً، لا يتم قبول سوى الوثائق والمخطوطات بصيغة .docx فقط.")
-    
+    if not DocumentProcessor:
+        raise HTTPException(status_code=503, detail="معالج المستندات غير متوفر حالياً.")
+    filename = file.filename or "document"
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in DocumentProcessor.ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"صيغة الملف غير مدعومة. {DocumentProcessor.allowed_formats_message()}",
+        )
+
     content = await file.read()
     if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=400, detail="المخطوطة المرفوعة ضخمة جداً، الحد الأقصى المسموح به هو 15 ميجابايت.")
+        raise HTTPException(
+            status_code=400,
+            detail="المخطوطة المرفوعة ضخمة جداً، الحد الأقصى المسموح به هو 20 ميجابايت.",
+        )
     return content
 
 # دالة بناء حالة البداية لوكيل LangGraph
@@ -251,54 +299,161 @@ def chunk_text(text: str, max_chunk_size: int = 8000) -> List[str]:
         chunks.append(" ".join(words[i:i + max_chunk_size]))
     return chunks
 
-def get_llm_client(engine: str):
+def get_llm_client(engine: str, max_tokens: Optional[int] = None):
     """تهيئة محركات الذكاء الاصطناعي بناءً على مفاتيح البيئة المحلية"""
+    llm_kwargs = {"temperature": 0.0}
+    if max_tokens is not None:
+        llm_kwargs["max_tokens"] = max_tokens
+
     if engine == "deepseek":
         return ChatOpenAI(
             openai_api_key=os.getenv("DEEPSEEK_API_KEY"),
             openai_api_base="https://api.deepseek.com/v1",
             model_name="deepseek-chat",
-            temperature=0.0
+            **llm_kwargs,
         )
     elif engine == "gemini":
         if not ChatGoogleGenerativeAI:
             raise HTTPException(status_code=422, detail="حزمة الاتصال بمحرك Gemini غير مثبتة أو مهيأة في السيرفر حالياً.")
+        gemini_kwargs = dict(llm_kwargs)
+        if max_tokens is not None:
+            gemini_kwargs["max_output_tokens"] = max_tokens
+            gemini_kwargs.pop("max_tokens", None)
         return ChatGoogleGenerativeAI(
             google_api_key=os.getenv("GOOGLE_API_KEY"),
             model="gemini-1.5-flash",
-            temperature=0.0
+            **gemini_kwargs,
         )
     elif engine == "openai":
-        return ChatOpenAI(
-            openai_api_key=os.getenv("OPENAI_API_KEY"),
-            model_name="gpt-4o",
-            temperature=0.0
-        )
+        raise ValueError("محرك OpenAI GPT-4o مُشطب من المنصة v4.2 — استخدم deepseek أو gemini.")
     else:
-        raise ValueError(f"المحرك {engine} غير مدعوم سحابياً.")
+        raise ValueError(f"المحرك {engine} غير مدعوم سحابياً. المحركات المعتمدة: deepseek، gemini.")
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def invoke_llm_with_retry(llm, prompt):
     """شبكة حماية وإعادة محاولة تلقائية في حال تذبذب اتصال الشبكة المحلية أو الخادم"""
     return llm.invoke(prompt)
 
-def extract_tokens_consumed(response) -> int:
-    """استخراج كمية التوكينات المستهلكة من استجابة المحرك الذكي بشكل آمن"""
-    try:
-        # 1. التحقق من التنسيق المعياري الموحد لـ LangChain
-        if hasattr(response, 'usage_metadata') and response.usage_metadata:
-            return response.usage_metadata.get("total_tokens", 0)
-        
-        # 2. التحقق من الخصائص الإضافية للاستجابة
-        if hasattr(response, 'response_metadata') and response.response_metadata:
-            meta = response.response_metadata
-            if "usage_metadata" in meta and meta["usage_metadata"]:
-                return meta["usage_metadata"].get("total_tokens", 0)
-            if "token_usage" in meta and meta["token_usage"]:
-                return meta["token_usage"].get("total_tokens", 0) or meta["token_usage"].get("total_token_count", 0)
-    except Exception as e:
-        logger.warning(f"تعذر استخراج استهلاك التوكنات: {str(e)}")
-    return 0
+
+def _parse_summary_llm_json(content: str) -> Dict[str, Any]:
+    clean = content.strip().replace("```json", "").replace("```", "").strip()
+    return json.loads(clean)
+
+
+def _summary_schema_rules(max_ideas: int) -> str:
+    return f"""
+        1. استخرج أهم {max_ideas} أفكار جوهرية يرتكز عليها النص. صغ كل فكرة في جملة خبرية وافية المعنى تفهم بمفردها وتطابق لغة العرب الفصحى. يُمنع استخراج عناوين جانية أو جمل مبتورة.
+        2. احصر كافة الأرقام، النسب المئوية، الميزانيات، أو التواريخ الحيوية واربط القيمة بسياقها التاريخي أو المالي الفعلي بدقة (افصل الحقلين تماماً).
+        3. استخرج أهم 7 كلمات مفتاحية تمثل الكشاف المعجمي الفعلي للنص. يُمنع منعاً باتاً استخراج أدوات الربط أو النفي مثل ("لا"، "بل"، "ما"، "على")، بل استخرج مصطلحات سيادية من صلب الموضوع.
+        4. المخرج الوحيد المسموح به هو كائن JSON صالح تماماً مطابق للهيكل أدناه، بدون أي مقدمات أو هوامش تفاعلية زائدة.
+
+        OUTPUT_SCHEMA:
+        {{
+            "core_ideas": [ {{ "id": 1, "idea": "نص الجملة الخبرية البليغة الكاملة" }} ],
+            "numerical_ledger": [ {{ "value": "الرقم أو التاريخ"، "context": "السياق الدلالي الدقيق للرقم" }} ],
+            "sovereign_keywords": ["مصطلح1", "مصطلح2"]
+        }}"""
+
+
+def _summarize_semantic_chunks(text: str) -> List[str]:
+    """تجزئة دلالية عبر Parser — تغطية كاملة دون قص [:30000]."""
+    from processors.json_document_parser import build_semantic_clusters
+
+    clusters, _, _ = build_semantic_clusters(text, None)
+    chunks = [c.combined_text.strip() for c in clusters if c.combined_text and c.combined_text.strip()]
+    return chunks if chunks else [text]
+
+
+def _summarize_text_map_reduce(
+    llm,
+    full_text: str,
+    text_chunks: List[str],
+    max_ideas: int,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Map-Reduce: كل جزء يُعالج كاملاً — يُمنع قص النص عند [:30000].
+    """
+    usage_acc: Dict[str, Any] = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "llm_calls": 0,
+        "estimated": False,
+    }
+
+    if len(text_chunks) == 1:
+        prompt = f"""
+        أنت "المستخلص اللغوي الدلالي v3.6" لـ "مدونة الخليل للتحرير اللغوي".
+        مهمتك الحصرية هي تفكيك النص واستخراج جوهره الفكري والرقمي وصياغته بأسلوب خبري بليغ ومكتمل الأركان النحوية.
+
+        قواعد الإنتاج الصارمة (Strict Operational Rules):
+        {_summary_schema_rules(max_ideas)}
+
+        النص المراد معالجته دلالياً:
+        ---
+        {text_chunks[0]}
+        ---
+        """
+        response = invoke_llm_with_retry(llm, prompt)
+        chunk_usage = extract_token_usage(
+            response,
+            prompt_text=prompt,
+            completion_text=getattr(response, "content", "") or "",
+        )
+        merge_usage_accumulator(usage_acc, chunk_usage)
+        parsed = _parse_summary_llm_json(response.content)
+        return parsed, usage_acc
+
+    per_chunk_ideas = max(3, min(10, (max_ideas // len(text_chunks)) + 2))
+    partials: List[Dict[str, Any]] = []
+
+    for idx, chunk in enumerate(text_chunks):
+        map_prompt = f"""
+        أنت "المستخلص اللغوي الدلالي v3.6" لـ "مدونة الخليل للتحرير اللغوي".
+        أمامك الجزء {idx + 1} من {len(text_chunks)} لمخطوطة طويلة — عالج هذا الجزء فقط دون افتراض ما في الأجزاء الأخرى.
+
+        قواعد الإنتاج الصارمة:
+        {_summary_schema_rules(per_chunk_ideas)}
+
+        النص (الجزء {idx + 1}/{len(text_chunks)}):
+        ---
+        {chunk}
+        ---
+        """
+        response = invoke_llm_with_retry(llm, map_prompt)
+        chunk_usage = extract_token_usage(
+            response,
+            prompt_text=map_prompt,
+            completion_text=getattr(response, "content", "") or "",
+        )
+        merge_usage_accumulator(usage_acc, chunk_usage)
+        partials.append(_parse_summary_llm_json(response.content))
+
+    reduce_prompt = f"""
+    أنت "مجمّع التلخيص الدلالي v3.6" لـ "مدونة الخليل للتحرير اللغوي".
+    أمامك {len(partials)} مخرجات JSON جزئية من أجزاء متتابعة لنفس المخطوطة (Map-Reduce).
+    دمجها في مخرج واحد متسق: أزل التكرار، واحفظ التنوع، ولا تسقط محاور أو أفكار ظهرت في الأجزاء المتأخرة.
+
+    قواعد الدمج:
+    {_summary_schema_rules(max_ideas)}
+    5. رقّم core_ideas من 1 إلى {max_ideas} بلا فجوات.
+    6. numerical_ledger: دمج بدون تكرار value.
+    7. sovereign_keywords: أفضل 7 مصطلحات فريدة من كل الأجزاء.
+
+    المخرجات الجزئية:
+    ---
+    {json.dumps(partials, ensure_ascii=False)}
+    ---
+    """
+    response = invoke_llm_with_retry(llm, reduce_prompt)
+    reduce_usage = extract_token_usage(
+        response,
+        prompt_text=reduce_prompt,
+        completion_text=getattr(response, "content", "") or "",
+    )
+    merge_usage_accumulator(usage_acc, reduce_usage)
+    parsed = _parse_summary_llm_json(response.content)
+    return parsed, usage_acc
 
 def build_khalil_summary_response(
     core_ideas: List[Dict],
@@ -402,15 +557,21 @@ async def chat(request: ChatRequest):
 async def extract_text(file: UploadFile = File(...)):
     content = await validate_uploaded_file(file)
     try:
-        extracted_text = DocumentProcessor.extract_text_from_docx(content)
+        extracted_text, source_type = DocumentProcessor.extract_text(
+            content, file.filename or "document.docx"
+        )
         return {
             "text": extracted_text,
             "filename": file.filename,
-            "size": len(content)
+            "format": source_type,
+            "extension": os.path.splitext(file.filename or "")[1].lower(),
+            "size": len(content),
         }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"خلل بنيوي أثناء قراءة ملف الوثيقة: {str(e)}")
-        raise HTTPException(status_code=500, detail="تعذر استخراج النص اللغوي؛ بنية المستند المرفوع تالفة.")
+        raise HTTPException(status_code=500, detail=f"تعذر استخراج النص: {str(e)}")
 
 @app.post("/preflight-check", summary="فحص جاهزية ونبض المحرك الذكي قبل الإرسال")
 async def preflight_check(
@@ -500,8 +661,8 @@ async def merge_drafts(request: MergeRequest):
 @app.post("/upload", summary="تهذيب ومراجعة نص الوثيقة المرفوعة فوراً", response_model=KhalilResponse)
 async def upload_document(file: UploadFile = File(...)):
     content = await validate_uploaded_file(file)
-    extracted_text = DocumentProcessor.extract_text_from_docx(content)
-    
+    extracted_text, _ = DocumentProcessor.extract_text(content, file.filename or "document.docx")
+
     if not extracted_text.strip():
         raise HTTPException(status_code=400, detail="تعذر استخراج النص المرجعي؛ المستند المرفوع فارغ تماماً.")
 
@@ -555,41 +716,12 @@ async def summarize(request: SummaryRequest):
     
     try:
         llm = get_llm_client(engine)
-        
-        # تفعيل آلية الـ Chunking لتأمين معالجة الكتب الضخمة
-        text_chunks = chunk_text(request.text, max_chunk_size=8000)
-        target_text = text_chunks[0] if len(text_chunks) == 1 else request.text[:30000] # قراءة النطاق الواسع للمخطوطة
-        
-        system_prompt = f"""
-        أنت "المستخلص اللغوي الدلالي v3.6" لـ "مدونة الخليل للتحرير اللغوي".
-        مهمتك الحصرية هي تفكيك النص واستخراج جوهره الفكري والرقمي وصياغته بأسلوب خبري بليغ ومكتمل الأركان النحوية.
 
-        قواعد الإنتاج الصارمة (Strict Operational Rules):
-        1. استخرج أهم {max_ideas} أفكار جوهرية يرتكز عليها النص. صغ كل فكرة في جملة خبرية وافية المعنى تفهم بمفردها وتطابق لغة العرب الفصحى. يُمنع استخراج عناوين جانية أو جمل مبتورة.
-        2. احصر كافة الأرقام، النسب المئوية، الميزانيات، أو التواريخ الحيوية واربط القيمة بسياقها التاريخي أو المالي الفعلي بدقة (افصل الحقلين تماماً).
-        3. استخرج أهم 7 كلمات مفتاحية تمثل الكشاف المعجمي الفعلي للنص. يُمنع منعاً باتاً استخراج أدوات الربط أو النفي مثل ("لا"، "بلbound"، "ما"، "على")، بل استخرج مصطلحات سيادية من صلب الموضوع.
-        4. المخرج الوحيد المسموح به هو كائن JSON صالح تماماً مطابق للهيكل أدناه، بدون أي مقدمات أو هوامش تفاعلية زائدة.
-
-        OUTPUT_SCHEMA:
-        {{
-            "core_ideas": [ {{ "id": 1, "idea": "نص الجملة الخبرية البليغة الكاملة" }} ],
-            "numerical_ledger": [ {{ "value": "الرقم أو التاريخ"، "context": "السياق الدلالي الدقيق للرقم" }} ],
-            "sovereign_keywords": ["مصطلح1", "مصطلح2"]
-        }}
-
-        النص المراد معالجته دلالياً:
-        ---
-        {target_text}
-        ---
-        """
-        
-        # استدعاء المحرك مع تفعيل درع الحماية وإعادة المحاولة التلقائية
-        response = invoke_llm_with_retry(llm, system_prompt)
-        
-        tokens_consumed = extract_tokens_consumed(response)
-        
-        clean_content = response.content.strip().replace("```json", "").replace("```", "").strip()
-        parsed_data = json.loads(clean_content)
+        text_chunks = _summarize_semantic_chunks(request.text)
+        parsed_data, usage = _summarize_text_map_reduce(
+            llm, request.text, text_chunks, max_ideas
+        )
+        tokens_consumed = usage["total_tokens"]
         
         # حساب عدد الجمل الأصلية بدقة تامة باستخدام مقسم الجمل المحلي
         raw_paragraphs = [p.strip() for p in request.text.split('\n') if len(p.strip()) > 30]
@@ -606,11 +738,14 @@ async def summarize(request: SummaryRequest):
             "engine": engine,
             "engine_description": engine_info["name"],
             "tokens_consumed": tokens_consumed,
+            "token_usage": usage,
             "original_sentences": original_sentences_count,
             "ideas_extracted": len(parsed_data.get("core_ideas", [])),
             "numbers_extracted": len(parsed_data.get("numerical_ledger", [])),
             "text_characters": text_length,
-            "chunks_processed": len(text_chunks)
+            "chunks_processed": len(text_chunks),
+            "map_reduce": len(text_chunks) > 1,
+            "clustering": "semantic_parser_v4.2",
         }
         
         final_response = build_khalil_summary_response(
@@ -625,6 +760,121 @@ async def summarize(request: SummaryRequest):
     except Exception as e:
         logger.error(f"⚠️ فشل عبور الطلب عبر المحرك السحابي [{engine}]: {str(e)}")
         raise HTTPException(status_code=502, detail=f"فشل المحرك الذكي في صياغة الجوهر. السبب: {str(e)}")
+
+@app.post("/consolidate", summary="بوابة الصهر الديناميكي وعكس الهندسة الدلالية v4.0", response_class=JSONResponse)
+async def consolidate(request: ConsolidateRequest):
+    """مسار مستقل: تفكيك الفوضى البنائية داخل الوثيقة وصهرها إلى بطاقات سيادية."""
+    engine = request.force_engine or "deepseek"
+    if engine == "local_hybrid" or engine == "openai":
+        engine = "deepseek"
+    if engine not in ("deepseek", "gemini"):
+        raise HTTPException(status_code=422, detail="محرك الصهر v4.2 يقتصر على DeepSeek-V3 أو Gemini Flash.")
+
+    reference_payload = None
+    if request.reference_json and request.reference_json.strip():
+        try:
+            reference_payload = json.loads(request.reference_json)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=422, detail=f"ملف الأصل JSON غير صالح: {exc}")
+
+    if not reference_payload:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "مسار الصهر v4.0 يتطلب رفع ملف الأصل JSON (منهجية المحاور السبعة). "
+                "بدونه يُنشئ النظام عناقيد زائفة ويستهلك توكنات بلا مخرجات."
+            ),
+        )
+
+    tokens_holder: Dict[str, Any] = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "llm_calls": 0,
+        "estimated": False,
+    }
+
+    def llm_invoke(prompt: str):
+        llm = get_llm_client(engine, max_tokens=8192)
+        return invoke_llm_with_retry(llm, prompt)
+
+    engine_labels = {
+        "deepseek": "deepseek_v3",
+        "gemini": "gemini_flash",
+    }
+
+    try:
+        consolidation = ConsolidationEngine(
+            llm_invoke=llm_invoke,
+            usage_accumulator=tokens_holder,
+        )
+        result = consolidation.run(
+            text=request.text,
+            reference_json=reference_payload,
+            custom_intent=request.custom_intent,
+            engine_name=engine_labels.get(engine, engine),
+        )
+        discovered = result["discovered_structure"]
+
+        if not discovered.get("core_ideas"):
+            raise HTTPException(
+                status_code=502,
+                detail="فشل استخلاص البطاقات المعرفية. تحقق من ملف الأصل ومن اتصال المحرك.",
+            )
+
+        token_usage = {
+            "input_tokens": tokens_holder["input_tokens"],
+            "output_tokens": tokens_holder["output_tokens"],
+            "total_tokens": tokens_holder["total_tokens"],
+            "llm_calls": tokens_holder["llm_calls"],
+            "estimated": tokens_holder.get("estimated", False),
+        }
+        discovered["_metadata"]["tokens_consumed"] = token_usage["total_tokens"]
+        discovered["_metadata"]["token_usage"] = token_usage
+        discovered["_metadata"]["engine_description"] = get_engine_description(engine)["name"]
+        discovered["export_content"] = build_consolidation_export(discovered)
+
+        payload = {
+            "status": "completed",
+            "token_usage": token_usage,
+            "discovered_structure": discovered,
+            "summary_analytics": discovered,
+        }
+        return JSONResponse(status_code=200, content=payload)
+
+    except HTTPException:
+        raise
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=502, detail=f"فشل تحليل JSON من المحرك: {exc}")
+    except Exception as exc:
+        logger.error(f"⚠️ فشل مسار الصهر الديناميكي [{engine}]: {exc}")
+        raise HTTPException(status_code=502, detail=f"فشل الصهر الديناميكي. السبب: {exc}")
+
+@app.post("/export/docx", summary="تصدير نتائج الصهر إلى Word منسّق (RTL)")
+async def export_consolidation_docx(request: DocxExportRequest):
+    """تحويل discovered_structure إلى مستند .docx جاهز للطباعة والمشاركة."""
+    try:
+        docx_bytes = ConsolidationDocxExporter.build(
+            discovered_structure=request.discovered_structure,
+            title=request.title or "جوهر المخطوطة — مدونة الخليل",
+            source_filename=request.source_filename,
+        )
+        from datetime import datetime
+        stamp = datetime.now().strftime("%Y%m%d_%H%M")
+        filename = f"khalil_consolidation_{stamp}.docx"
+        return Response(
+            content=docx_bytes,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Length": str(len(docx_bytes)),
+            },
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+        logger.error(f"فشل تصدير DOCX: {exc}")
+        raise HTTPException(status_code=500, detail=f"تعذر إنشاء مستند Word: {exc}")
 
 @app.get("/health", summary="فحص صحة واستقرار الخدمة الشامل (Health Check)") 
 async def health_check():

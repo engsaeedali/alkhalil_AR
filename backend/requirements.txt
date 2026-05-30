@@ -9,6 +9,8 @@ langchain-openai
 langchain-google-genai
 python-multipart
 python-docx
+pypdf>=4.0.0
+striprtf>=0.0.26
 httpx
 termcolor
 networkx

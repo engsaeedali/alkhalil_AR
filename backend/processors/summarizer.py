@@ -5,6 +5,8 @@ import math
 from typing import List, Dict, Optional, Tuple
 from collections import Counter, defaultdict
 
+from processors.text_integrity import clip_at_boundary as _clip_context
+
 class ArabicExtractiveSummarizer:
     """
     محرك التلخيص الاستخلاصي الهجين المطور - نسخة الإنتاج v2.5 (محلي 100%)
@@ -204,5 +206,5 @@ class ArabicExtractiveSummarizer:
                     start = max(0, match.start() - 40)
                     end = min(len(text), match.end() + 40)
                     context = text[start:end].strip().replace('\n', ' ')
-                    results.append({"value": value, "context": context[:100]})
+                    results.append({"value": value, "context": _clip_context(context, 320)})
         return results[:10]

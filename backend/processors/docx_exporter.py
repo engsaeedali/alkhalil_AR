@@ -12,8 +12,20 @@ from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor, Cm
 
 
-ARABIC_FONT = "Traditional Arabic"
-FALLBACK_FONT = "Arial"
+DEFAULT_FONT = "Calibri Light"
+DEFAULT_SIZE_PT = 14
+
+
+def _apply_document_defaults(doc: Document) -> None:
+    """خط ومقاس المستند الافتراضيان (يظهران عند فتح الملف في Word)."""
+    normal = doc.styles["Normal"]
+    normal.font.name = DEFAULT_FONT
+    normal.font.size = Pt(DEFAULT_SIZE_PT)
+    r_pr = normal._element.get_or_add_rPr()
+    r_fonts = OxmlElement("w:rFonts")
+    for attr in ("ascii", "hAnsi", "cs", "eastAsia", "rtl"):
+        r_fonts.set(qn(f"w:{attr}"), DEFAULT_FONT)
+    r_pr.insert(0, r_fonts)
 
 
 def _set_paragraph_rtl(paragraph) -> None:
@@ -23,17 +35,20 @@ def _set_paragraph_rtl(paragraph) -> None:
     paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
 
 
-def _set_run_font(run, size_pt: int = 14, bold: bool = False, color: Optional[RGBColor] = None) -> None:
+def _set_run_font(
+    run,
+    size_pt: int = DEFAULT_SIZE_PT,
+    bold: bool = False,
+    color: Optional[RGBColor] = None,
+) -> None:
     run.bold = bold
     run.font.size = Pt(size_pt)
-    run.font.name = FALLBACK_FONT
+    run.font.name = DEFAULT_FONT
     run.font.rtl = True
     r_pr = run._element.get_or_add_rPr()
     r_fonts = OxmlElement("w:rFonts")
-    r_fonts.set(qn("w:ascii"), FALLBACK_FONT)
-    r_fonts.set(qn("w:hAnsi"), FALLBACK_FONT)
-    r_fonts.set(qn("w:cs"), ARABIC_FONT)
-    r_fonts.set(qn("w:rtl"), ARABIC_FONT)
+    for attr in ("ascii", "hAnsi", "cs", "eastAsia", "rtl"):
+        r_fonts.set(qn(f"w:{attr}"), DEFAULT_FONT)
     r_pr.insert(0, r_fonts)
     if color:
         run.font.color.rgb = color
@@ -43,7 +58,7 @@ def _add_heading(doc: Document, text: str, level: int = 1) -> None:
     p = doc.add_paragraph()
     _set_paragraph_rtl(p)
     run = p.add_run(text)
-    sizes = {1: 22, 2: 16, 3: 14}
+    sizes = {1: 20, 2: 16, 3: DEFAULT_SIZE_PT}
     colors = {
         1: RGBColor(0xB4, 0x53, 0x09),
         2: RGBColor(0x1E, 0x3A, 0x5F),
@@ -54,7 +69,7 @@ def _add_heading(doc: Document, text: str, level: int = 1) -> None:
     p.paragraph_format.space_after = Pt(8)
 
 
-def _add_body(doc: Document, text: str, size: int = 14, italic: bool = False) -> None:
+def _add_body(doc: Document, text: str, size: int = DEFAULT_SIZE_PT, italic: bool = False) -> None:
     if not text or not str(text).strip():
         return
     p = doc.add_paragraph()
@@ -70,9 +85,9 @@ def _add_label_value(doc: Document, label: str, value: str) -> None:
     p = doc.add_paragraph()
     _set_paragraph_rtl(p)
     label_run = p.add_run(f"{label}: ")
-    _set_run_font(label_run, size_pt=12, bold=True, color=RGBColor(0x64, 0x74, 0x8B))
+    _set_run_font(label_run, size_pt=DEFAULT_SIZE_PT, bold=True, color=RGBColor(0x64, 0x74, 0x8B))
     value_run = p.add_run(value)
-    _set_run_font(value_run, size_pt=13)
+    _set_run_font(value_run, size_pt=DEFAULT_SIZE_PT)
     p.paragraph_format.space_after = Pt(4)
 
 
@@ -84,8 +99,10 @@ class ConsolidationDocxExporter:
         discovered_structure: Dict[str, Any],
         title: str = "جوهر المخطوطة — مدونة الخليل",
         source_filename: Optional[str] = None,
+        manuscript_content: Optional[str] = None,
     ) -> bytes:
         doc = Document()
+        _apply_document_defaults(doc)
 
         section = doc.sections[0]
         section.page_height = Cm(29.7)
@@ -99,7 +116,7 @@ class ConsolidationDocxExporter:
         _add_body(
             doc,
             "مستخلص سيادي — الصهر الديناميكي وعكس الهندسة الدلالية v4.0",
-            size=12,
+            size=DEFAULT_SIZE_PT,
             italic=True,
         )
 
@@ -113,12 +130,25 @@ class ConsolidationDocxExporter:
             meta_bits.append(f"وضع التجميع: {meta['clustering_mode']}")
         if meta.get("engine_description") or meta.get("engine_utilized"):
             meta_bits.append(f"المحرك: {meta.get('engine_description') or meta.get('engine_utilized')}")
-        _add_body(doc, " | ".join(meta_bits), size=10, italic=True)
+        _add_body(doc, " | ".join(meta_bits), size=DEFAULT_SIZE_PT, italic=True)
 
         doc.add_paragraph()
 
+        if manuscript_content and str(manuscript_content).strip():
+            _add_heading(doc, "المخطوطة اللغوية الموحدة (المحتوى الكامل)", level=2)
+            for para in str(manuscript_content).strip().split("\n\n"):
+                chunk = para.strip()
+                if chunk:
+                    _add_body(doc, chunk)
+            doc.add_paragraph()
+
         ideas: List[Dict] = discovered_structure.get("core_ideas") or []
-        _add_heading(doc, "البطاقات المعرفية السيادية", level=2)
+        section_ideas_title = (
+            "البطاقات المعرفية السيادية"
+            if ideas and (ideas[0].get("layers") or ideas[0].get("section_title"))
+            else "الأفكار والبطاقات"
+        )
+        _add_heading(doc, section_ideas_title, level=2)
 
         if not ideas:
             _add_body(doc, "لم تُستخلص بطاقات معرفية.", italic=True)
@@ -156,7 +186,7 @@ class ConsolidationDocxExporter:
                 for p in cell.paragraphs:
                     _set_paragraph_rtl(p)
                     for run in p.runs:
-                        _set_run_font(run, size_pt=11, bold=True)
+                        _set_run_font(run, size_pt=DEFAULT_SIZE_PT, bold=True)
 
             for item in ledger[:20]:
                 row = table.add_row().cells
@@ -166,7 +196,7 @@ class ConsolidationDocxExporter:
                     for p in cell.paragraphs:
                         _set_paragraph_rtl(p)
                         for run in p.runs:
-                            _set_run_font(run, size_pt=11)
+                            _set_run_font(run, size_pt=DEFAULT_SIZE_PT)
         else:
             _add_body(doc, "لا توجد أرقام أو تواريخ بارزة.", italic=True)
 
@@ -194,11 +224,11 @@ class ConsolidationDocxExporter:
                 f" | استدعاءات LLM: {token_usage.get('llm_calls', '—')}"
             )
         audit = "ناجح" if meta.get("audit_passed") else "تحذيرات — يُراجع يدوياً"
-        _add_body(doc, token_line, size=10)
+        _add_body(doc, token_line, size=DEFAULT_SIZE_PT)
         _add_body(
             doc,
             f"مدونة الخليل للتحرير اللغوي — Copyright © {datetime.now().year} | التدقيق: {audit}",
-            size=9,
+            size=DEFAULT_SIZE_PT,
             italic=True,
         )
 

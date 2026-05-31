@@ -3,6 +3,8 @@ import sys
 import uuid
 import logging
 import json
+import asyncio
+import time
 from typing import List, Dict, Optional, Any, Tuple
 from contextlib import asynccontextmanager
 
@@ -28,7 +30,7 @@ from utils.token_meter import (
 from processors.summarizer import ArabicExtractiveSummarizer
 from processors.consolidation_engine import ConsolidationEngine, build_consolidation_export
 from processors.docx_exporter import ConsolidationDocxExporter
-from utils.summary_router import choose_summarizer_engine, get_engine_description, MIN_TEXT_FOR_LOCAL
+from utils.summary_router import choose_summarizer_engine, get_engine_description
 from tenacity import retry, stop_after_attempt, wait_exponential
 from langchain_openai import ChatOpenAI
 
@@ -52,6 +54,41 @@ except ImportError:
     ChatGoogleGenerativeAI = None
 
 logger = setup_logger("main")
+
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+
+def _google_api_key() -> Optional[str]:
+    return os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+
+
+def _format_llm_exception(exc: BaseException) -> str:
+    """فك RetryError لإظهار سبب ChatGoogleGenerativeAIError الحقيقي."""
+    try:
+        from tenacity import RetryError
+
+        if isinstance(exc, RetryError) and exc.last_attempt.failed:
+            cause = exc.last_attempt.exception()
+            if cause is not None:
+                return f"{type(cause).__name__}: {cause}"
+    except Exception:
+        pass
+    return str(exc)
+
+
+def _is_quota_or_rate_error(exc: BaseException) -> bool:
+    msg = _format_llm_exception(exc).lower()
+    return any(
+        token in msg
+        for token in (
+            "resource_exhausted",
+            "429",
+            "quota",
+            "rate limit",
+            "rate_limit",
+            "too many requests",
+        )
+    )
 
 # فحص متغيرات البيئة الحيوية عند بدء التشغيل
 required_env_vars = ["DEEPSEEK_API_KEY", "GOOGLE_API_KEY"]
@@ -96,6 +133,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Extract-Latency-Ms"],
 )
 
 # [MODIFY] 2. نظام تتبع الحركة ومعرفات الطلبات الموحد (ملاحظة 4 و 7)
@@ -220,6 +258,8 @@ class DocxExportRequest(BaseModel):
     discovered_structure: Dict[str, Any] = Field(..., description="هيكل discovered_structure من /consolidate")
     title: Optional[str] = Field("جوهر المخطوطة — مدونة الخليل", description="عنوان المستند")
     source_filename: Optional[str] = Field(None, description="اسم الملف المصدر")
+    manuscript_content: Optional[str] = Field(None, description="نص المخطوطة الكامل (دمج المسودات)")
+    export_kind: Optional[str] = Field("consolidate", description="merge | summarize | consolidate")
 
     @validator('discovered_structure')
     def validate_structure(cls, v):
@@ -227,6 +267,15 @@ class DocxExportRequest(BaseModel):
             raise ValueError("هيكل المخرجات فارغ أو غير صالح.")
         if not v.get("core_ideas") and not v.get("export_content"):
             raise ValueError("لا توجد بطاقات معرفية للتصدير.")
+        return v
+
+    @validator('export_kind')
+    def validate_export_kind(cls, v):
+        if v is None:
+            return "consolidate"
+        allowed = {"merge", "summarize", "consolidate"}
+        if v not in allowed:
+            raise ValueError(f"export_kind غير مدعوم. استخدم: {', '.join(sorted(allowed))}")
         return v
 
 # دالة فحص أحجام المستندات المرفوعة
@@ -315,13 +364,17 @@ def get_llm_client(engine: str, max_tokens: Optional[int] = None):
     elif engine == "gemini":
         if not ChatGoogleGenerativeAI:
             raise HTTPException(status_code=422, detail="حزمة الاتصال بمحرك Gemini غير مثبتة أو مهيأة في السيرفر حالياً.")
+        google_key = _google_api_key()
+        if not google_key:
+            raise HTTPException(status_code=422, detail="مفتاح GOOGLE_API_KEY أو GEMINI_API_KEY غير مهيأ.")
         gemini_kwargs = dict(llm_kwargs)
         if max_tokens is not None:
             gemini_kwargs["max_output_tokens"] = max_tokens
             gemini_kwargs.pop("max_tokens", None)
         return ChatGoogleGenerativeAI(
-            google_api_key=os.getenv("GOOGLE_API_KEY"),
-            model="gemini-1.5-flash",
+            google_api_key=google_key,
+            model=GEMINI_MODEL,
+            max_retries=5,
             **gemini_kwargs,
         )
     elif engine == "openai":
@@ -555,18 +608,33 @@ async def chat(request: ChatRequest):
 
 @app.post("/extract-text", summary="استخراج النص من المسودة المرفوعة")
 async def extract_text(file: UploadFile = File(...)):
+    """v4.7 — بوابة عبور ميكانيكية: قراءة غير متزامنة + استخراج صافٍ بلا LLM."""
+    t0 = time.perf_counter()
     content = await validate_uploaded_file(file)
     try:
-        extracted_text, source_type = DocumentProcessor.extract_text(
-            content, file.filename or "document.docx"
+        extracted_text, source_type = await asyncio.to_thread(
+            DocumentProcessor.extract_text,
+            content,
+            file.filename or "document.docx",
         )
-        return {
-            "text": extracted_text,
-            "filename": file.filename,
-            "format": source_type,
-            "extension": os.path.splitext(file.filename or "")[1].lower(),
-            "size": len(content),
-        }
+        elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+        logger.info(
+            "extract-text %s (%d bytes) -> %d chars in %.0f ms",
+            file.filename,
+            len(content),
+            len(extracted_text),
+            elapsed_ms,
+        )
+        return JSONResponse(
+            content={
+                "text": extracted_text,
+                "filename": file.filename,
+                "format": source_type,
+                "extension": os.path.splitext(file.filename or "")[1].lower(),
+                "size": len(content),
+            },
+            headers={"X-Extract-Latency-Ms": str(elapsed_ms)},
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -618,22 +686,21 @@ async def preflight_check(
             return {"status": "error", "message": "تعذر تأمين الاتصال بالمحرر الذكي؛ يرجى التحقق من استقرار الشبكة."}
             
     elif provider == "gemini":
-        g_key = os.getenv("GOOGLE_API_KEY")
+        g_key = _google_api_key()
         if not g_key:
             return {"status": "error", "message": "تنبيه: تهيئة خادم المساعد المختار غير مكتملة، يرجى تفقّد مفاتيح التهيئة."}
         if not ChatGoogleGenerativeAI:
             return {"status": "error", "message": "مكتبة المعالجة الأساسية الموجهة لـ لغة الضاد غير متوفرة في الخلفية."}
         try:
-            # استخدام محرك سريع وبدون إعادة محاولة للتأكد الفوري من المفتاح
             check_llm = ChatGoogleGenerativeAI(
-                model="gemini-2.5-flash", 
+                model=GEMINI_MODEL,
                 google_api_key=g_key,
-                max_retries=0
+                max_retries=0,
             )
             await check_llm.ainvoke("مرحبا")
             return {"status": "ready", "message": "تم التحقق من جاهزية الخليل بنجاح والمحرك مستقر"}
         except Exception as e:
-            logger.error(f"فشل استدعاء نموذج Gemini الـ API: {str(e)}")
+            logger.error(f"فشل استدعاء نموذج Gemini الـ API: {_format_llm_exception(e)}")
             return {"status": "error", "message": "تعذر تأمين الاتصال بالمحرر الذكي؛ يرجى التحقق من استقرار الشبكة."}
     else:
         return {"status": "error", "message": "المحرر الذكي المختار غير مدرج بالمكتبة، يرجى تحديد اختيار معتمد."}
@@ -661,7 +728,11 @@ async def merge_drafts(request: MergeRequest):
 @app.post("/upload", summary="تهذيب ومراجعة نص الوثيقة المرفوعة فوراً", response_model=KhalilResponse)
 async def upload_document(file: UploadFile = File(...)):
     content = await validate_uploaded_file(file)
-    extracted_text, _ = DocumentProcessor.extract_text(content, file.filename or "document.docx")
+    extracted_text, _ = await asyncio.to_thread(
+        DocumentProcessor.extract_text,
+        content,
+        file.filename or "document.docx",
+    )
 
     if not extracted_text.strip():
         raise HTTPException(status_code=400, detail="تعذر استخراج النص المرجعي؛ المستند المرفوع فارغ تماماً.")
@@ -693,52 +764,86 @@ async def summarize(request: SummaryRequest):
 
     max_ideas = 20 if text_length > 15000 else 5
 
-    try:
-        llm = get_llm_client(engine)
+    engines_to_try: List[str] = [engine]
+    if engine == "gemini" and os.getenv("DEEPSEEK_API_KEY"):
+        engines_to_try.append("deepseek")
 
-        text_chunks = _summarize_semantic_chunks(request.text)
-        parsed_data, usage = _summarize_text_map_reduce(
-            llm, request.text, text_chunks, max_ideas
-        )
-        tokens_consumed = usage["total_tokens"]
-        
-        # حساب عدد الجمل الأصلية بدقة تامة باستخدام مقسم الجمل المحلي
-        raw_paragraphs = [p.strip() for p in request.text.split('\n') if len(p.strip()) > 30]
-        if not raw_paragraphs:
-            raw_paragraphs = [request.text.strip()]
-        all_sentences = []
-        for para in raw_paragraphs:
-            sents = ArabicExtractiveSummarizer._split_sentences(para)
-            all_sentences.extend(sents)
-        original_sentences_count = len(all_sentences)
-        
-        metadata = {
-            "processing_tier": "llm_generative_v4.5",
-            "engine": engine,
-            "engine_description": engine_info["name"],
-            "tokens_consumed": tokens_consumed,
-            "token_usage": usage,
-            "original_sentences": original_sentences_count,
-            "ideas_extracted": len(parsed_data.get("core_ideas", [])),
-            "numbers_extracted": len(parsed_data.get("numerical_ledger", [])),
-            "text_characters": text_length,
-            "chunks_processed": len(text_chunks),
-            "map_reduce": len(text_chunks) > 1,
-            "clustering": "semantic_parser_v4.5",
-        }
-        
-        final_response = build_khalil_summary_response(
-            core_ideas=parsed_data.get("core_ideas", []),
-            numerical_ledger=parsed_data.get("numerical_ledger", []),
-            sovereign_keywords=parsed_data.get("sovereign_keywords", []),
-            metadata=metadata,
-            output_format=request.format
-        )
-        return JSONResponse(status_code=200, content=final_response)
+    last_error: Optional[BaseException] = None
+    for attempt_engine in engines_to_try:
+        engine_info = get_engine_description(attempt_engine)  # type: ignore[arg-type]
+        try:
+            llm = get_llm_client(attempt_engine)
+            text_chunks = _summarize_semantic_chunks(request.text)
+            parsed_data, usage = await asyncio.to_thread(
+                _summarize_text_map_reduce,
+                llm,
+                request.text,
+                text_chunks,
+                max_ideas,
+            )
+            tokens_consumed = usage["total_tokens"]
 
-    except Exception as e:
-        logger.error(f"⚠️ فشل عبور الطلب عبر المحرك السحابي [{engine}]: {str(e)}")
-        raise HTTPException(status_code=502, detail=f"فشل المحرك الذكي في صياغة الجوهر. السبب: {str(e)}")
+            raw_paragraphs = [p.strip() for p in request.text.split('\n') if len(p.strip()) > 30]
+            if not raw_paragraphs:
+                raw_paragraphs = [request.text.strip()]
+            all_sentences = []
+            for para in raw_paragraphs:
+                sents = ArabicExtractiveSummarizer._split_sentences(para)
+                all_sentences.extend(sents)
+            original_sentences_count = len(all_sentences)
+
+            fallback_note = None
+            if attempt_engine != engine:
+                fallback_note = (
+                    f"تم التحويل تلقائياً من {engine} إلى DeepSeek "
+                    "لأن حصة Gemini اليومية نفدت (Free Tier)."
+                )
+                logger.warning(fallback_note)
+
+            metadata = {
+                "processing_tier": "llm_generative_v4.5",
+                "engine": attempt_engine,
+                "engine_description": engine_info["name"],
+                "engine_fallback": fallback_note,
+                "tokens_consumed": tokens_consumed,
+                "token_usage": usage,
+                "original_sentences": original_sentences_count,
+                "ideas_extracted": len(parsed_data.get("core_ideas", [])),
+                "numbers_extracted": len(parsed_data.get("numerical_ledger", [])),
+                "text_characters": text_length,
+                "chunks_processed": len(text_chunks),
+                "map_reduce": len(text_chunks) > 1,
+                "clustering": "semantic_parser_v4.5",
+            }
+
+            final_response = build_khalil_summary_response(
+                core_ideas=parsed_data.get("core_ideas", []),
+                numerical_ledger=parsed_data.get("numerical_ledger", []),
+                sovereign_keywords=parsed_data.get("sovereign_keywords", []),
+                metadata=metadata,
+                output_format=request.format,
+            )
+            return JSONResponse(status_code=200, content=final_response)
+
+        except Exception as e:
+            last_error = e
+            detail = _format_llm_exception(e)
+            logger.error(f"⚠️ فشل عبور الطلب عبر المحرك [{attempt_engine}]: {detail}")
+            if (
+                attempt_engine == "gemini"
+                and _is_quota_or_rate_error(e)
+                and len(engines_to_try) > 1
+            ):
+                continue
+            break
+
+    detail = _format_llm_exception(last_error) if last_error else "خطأ غير معروف"
+    if _is_quota_or_rate_error(last_error) if last_error else False:
+        detail = (
+            "نفدت حصة Gemini المجانية (حد 20 طلب/يوم للنموذج gemini-2.5-flash). "
+            "اختر DeepSeek من قائمة المحركات أو انتظر إعادة ضبط الحصة."
+        )
+    raise HTTPException(status_code=502, detail=f"فشل المحرك الذكي في صياغة الجوهر. السبب: {detail}")
 
 @app.post("/consolidate", summary="بوابة الصهر الديناميكي وعكس الهندسة الدلالية v4.0", response_class=JSONResponse)
 async def consolidate(request: ConsolidateRequest):
@@ -826,8 +931,9 @@ async def consolidate(request: ConsolidateRequest):
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=502, detail=f"فشل تحليل JSON من المحرك: {exc}")
     except Exception as exc:
-        logger.error(f"⚠️ فشل مسار الصهر الديناميكي [{engine}]: {exc}")
-        raise HTTPException(status_code=502, detail=f"فشل الصهر الديناميكي. السبب: {exc}")
+        detail = _format_llm_exception(exc)
+        logger.error(f"⚠️ فشل مسار الصهر الديناميكي [{engine}]: {detail}")
+        raise HTTPException(status_code=502, detail=f"فشل الصهر الديناميكي. السبب: {detail}")
 
 @app.post("/export/docx", summary="تصدير نتائج الصهر إلى Word منسّق (RTL)")
 async def export_consolidation_docx(request: DocxExportRequest):
@@ -837,10 +943,16 @@ async def export_consolidation_docx(request: DocxExportRequest):
             discovered_structure=request.discovered_structure,
             title=request.title or "جوهر المخطوطة — مدونة الخليل",
             source_filename=request.source_filename,
+            manuscript_content=request.manuscript_content,
         )
         from datetime import datetime
         stamp = datetime.now().strftime("%Y%m%d_%H%M")
-        filename = f"khalil_consolidation_{stamp}.docx"
+        prefix = {
+            "merge": "khalil_merge",
+            "summarize": "khalil_summary",
+            "consolidate": "khalil_consolidation",
+        }.get(request.export_kind or "consolidate", "khalil_export")
+        filename = f"{prefix}_{stamp}.docx"
         return Response(
             content=docx_bytes,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -855,15 +967,36 @@ async def export_consolidation_docx(request: DocxExportRequest):
         logger.error(f"فشل تصدير DOCX: {exc}")
         raise HTTPException(status_code=500, detail=f"تعذر إنشاء مستند Word: {exc}")
 
+def _pdf_libs_ready() -> dict[str, bool]:
+    out = {"pypdf": False, "pymupdf": False}
+    try:
+        import pypdf  # noqa: F401
+
+        out["pypdf"] = True
+    except ImportError:
+        pass
+    try:
+        import fitz  # noqa: F401
+
+        out["pymupdf"] = True
+    except ImportError:
+        pass
+    return out
+
+
 @app.get("/health", summary="فحص صحة واستقرار الخدمة الشامل (Health Check)") 
 async def health_check():
+    pdf_libs = _pdf_libs_ready()
     return {
         "status": "healthy",
         "components": {
             "api_engine": "up",
-            "version": "2.1.0",
+            "version": "4.7.1",
+            "gemini_model": GEMINI_MODEL,
             "deepseek_integration": bool(os.getenv("DEEPSEEK_API_KEY")),
-            "gemini_integration": bool(os.getenv("GOOGLE_API_KEY"))
+            "gemini_integration": bool(_google_api_key()),
+            "pdf_extract": pdf_libs,
+            "pdf_ready": pdf_libs["pypdf"],
         }
     }
 

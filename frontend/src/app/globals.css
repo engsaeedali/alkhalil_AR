@@ -4,6 +4,33 @@
   --font-sans: var(--font-cairo);
 }
 
+/* ——— ثيم داكن (افتراضي SaaS) ——— */
+[data-theme="sovereign-dark"] {
+  color-scheme: dark;
+  --background: #020617;
+  --foreground: #f8fafc;
+  --k-bg: #020617;
+  --k-surface: #0f172a;
+  --k-surface-elevated: #1e293b;
+  --k-border: #1e293b;
+  --k-text: #f1f5f9;
+  --k-muted: #94a3b8;
+}
+
+/* ——— ثيم Oatmeal فاتح ——— */
+[data-theme="oatmeal"] {
+  color-scheme: light;
+  --background: #f5f5f4;
+  --foreground: #1c1917;
+  --k-bg: #f5f5f4;
+  --k-surface: #ffffff;
+  --k-surface-elevated: #fafaf9;
+  --k-border: #e7e5e4;
+  --k-text: #1c1917;
+  --k-muted: #57534e;
+  font-size: 15px;
+}
+
 :root {
   --background: #020617;
   --foreground: #f8fafc;
@@ -13,4 +40,5 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: var(--font-sans), sans-serif;
+  transition: background-color 0.25s ease, color 0.2s ease;
 }

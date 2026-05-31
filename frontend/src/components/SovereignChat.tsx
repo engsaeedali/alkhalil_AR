@@ -12,7 +12,6 @@ import {
   Download, 
   RefreshCw, 
   ArrowLeft, 
-  Cpu,
   Layers,
   FileText,
   CheckCircle2,
@@ -28,33 +27,89 @@ import {
   LogOut
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import MainTextWorkbench, {
+  normalizeWorkbenchPayload,
+  TASK_LOADING_PRIMARY,
+  VIEWPORT_TEXT,
+} from "@/components/MainTextWorkbench";
+import ProcessingBrandSpinner from "@/components/ProcessingBrandSpinner";
+import ThemeToggle from "@/components/ThemeToggle";
+import { useKhalilTheme } from "@/components/ThemeProvider";
+import { themeClasses } from "@/lib/themeClasses";
+import ExportActionBar from "@/components/ExportActionBar";
 
 const getApiUrl = (): string => {
   if (process.env.NEXT_PUBLIC_API_URL) {
-    return process.env.NEXT_PUBLIC_API_URL;
+    return process.env.NEXT_PUBLIC_API_URL.replace(/\/$/, "");
   }
   if (typeof window !== "undefined") {
     const hostname = window.location.hostname;
-    if (hostname === "localhost" || hostname === "127.0.0.1") {
-      return "http://127.0.0.1:8000";
+    const isLocal =
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname === "[::1]";
+    if (isLocal) {
+      // بروكسي Next.js — نفس الأصل، بلا CORS
+      return "/api";
     }
     return "/_/backend";
   }
   return "http://127.0.0.1:8000";
 };
 
-const API_BASE_URL = getApiUrl();
-
-type OperationMode = "edit" | "summarize" | "consolidate";
-
-const TASK_LOADING_PRIMARY: Record<OperationMode, string> = {
-  summarize: "🔄 جاري تلخيص النص وحصر الأفكار الكبرى...",
-  edit: "🔄 جاري إعادة صياغة النص وتحسين الحبكة اللغوية...",
-  consolidate: "🔄 جاري تجميع الأفكار الرئيسية وسبك المسودات لغوياً...",
+/** طلبات LLM طويلة — اتصال مباشر بالباكند (بروكسي Next يقطع عند ~30s) */
+const getHeavyApiUrl = (): string => {
+  if (process.env.NEXT_PUBLIC_API_URL) {
+    return process.env.NEXT_PUBLIC_API_URL.replace(/\/$/, "");
+  }
+  if (typeof window !== "undefined") {
+    const hostname = window.location.hostname;
+    const isLocal =
+      hostname === "localhost" ||
+      hostname === "127.0.0.1" ||
+      hostname === "[::1]";
+    if (isLocal) {
+      return "http://127.0.0.1:8000";
+    }
+  }
+  return getApiUrl();
 };
 
-/** منظرة النص v4.5 — خط مكبر للقراءة */
-const VIEWPORT_TEXT = "text-[20px] leading-relaxed";
+const fetchApiError = (err: unknown, endpoint: string, baseUrl?: string): string => {
+  const base = baseUrl || getApiUrl();
+  if (err instanceof TypeError && String(err.message).includes("fetch")) {
+    return `تعذر الاتصال بالخادم (${base}${endpoint}). تأكد أن الباكند يعمل: uvicorn على المنفذ 8000.`;
+  }
+  return err instanceof Error ? err.message : "خطأ غير متوقع";
+};
+
+const parseApiDetail = (payload: unknown, fallback: string): string => {
+  if (!payload || typeof payload !== "object") return fallback;
+  const detail = (payload as { detail?: unknown }).detail;
+  if (typeof detail === "string" && detail.trim()) return detail;
+  if (Array.isArray(detail)) {
+    return detail
+      .map((item) =>
+        typeof item === "object" && item && "msg" in item
+          ? String((item as { msg: unknown }).msg)
+          : String(item),
+      )
+      .join(" — ");
+  }
+  const message = (payload as { message?: unknown }).message;
+  if (typeof message === "string" && message.trim()) return message;
+  return fallback;
+};
+
+const readApiError = async (res: Response, fallback: string): Promise<string> => {
+  const raw = await res.text().catch(() => "");
+  if (!raw.trim()) return `${fallback} (${res.status})`;
+  try {
+    return parseApiDetail(JSON.parse(raw), raw.trim() || `${fallback} (${res.status})`);
+  } catch {
+    return raw.trim() || `${fallback} (${res.status})`;
+  }
+};
 
 interface Message {
   id: string;
@@ -95,6 +150,8 @@ interface Message {
 }
 
 export default function SovereignChat() {
+  const { theme } = useKhalilTheme();
+  const tc = themeClasses(theme);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   
   // Step-by-Step UX states
@@ -123,7 +180,17 @@ export default function SovereignChat() {
   const [isMerging, setIsMerging] = useState(false);
   const [mergeLogs, setMergeLogs] = useState<string[]>([]);
   const [elapsedTime, setElapsedTime] = useState<number>(0);
-  const timerRef = useRef<any>(null);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  /** ميقات استخراج النص من الملفات (منفصل عن ميقات السبك) */
+  const [extractElapsedMs, setExtractElapsedMs] = useState(0);
+  const [extractTimerPhase, setExtractTimerPhase] = useState<
+    "idle" | "running" | "done" | "error"
+  >("idle");
+  const [extractServerMs, setExtractServerMs] = useState<number | null>(null);
+  const extractTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const extractStartRef = useRef(0);
+  const extractPendingRef = useRef(0);
   
   // Interactive Workspace states
   const [messages, setMessages] = useState<Message[]>([]);
@@ -187,6 +254,53 @@ export default function SovereignChat() {
     return `${pad(minutes)}:${pad(seconds)}.${pad(centiseconds)}`;
   };
 
+  const parseServerExtractMs = (res: Response): number | undefined => {
+    const raw = res.headers.get("X-Extract-Latency-Ms");
+    if (!raw) return undefined;
+    const n = parseFloat(raw);
+    return Number.isFinite(n) ? n : undefined;
+  };
+
+  const stopExtractTimerInterval = () => {
+    if (extractTimerRef.current) {
+      clearInterval(extractTimerRef.current);
+      extractTimerRef.current = null;
+    }
+  };
+
+  const startExtractTimer = () => {
+    if (extractPendingRef.current === 0) {
+      extractStartRef.current = Date.now();
+      setExtractElapsedMs(0);
+      setExtractServerMs(null);
+      setExtractTimerPhase("running");
+      stopExtractTimerInterval();
+      extractTimerRef.current = setInterval(() => {
+        setExtractElapsedMs(Date.now() - extractStartRef.current);
+      }, 10);
+    }
+    extractPendingRef.current += 1;
+  };
+
+  const finishExtractTimer = (success: boolean, serverMs?: number) => {
+    extractPendingRef.current = Math.max(0, extractPendingRef.current - 1);
+    if (extractPendingRef.current > 0) return;
+
+    stopExtractTimerInterval();
+    const clientMs = Date.now() - extractStartRef.current;
+    setExtractElapsedMs(clientMs);
+    if (serverMs != null) setExtractServerMs(serverMs);
+    setExtractTimerPhase(success ? "done" : "error");
+  };
+
+  const resetExtractTimer = () => {
+    extractPendingRef.current = 0;
+    stopExtractTimerInterval();
+    setExtractElapsedMs(0);
+    setExtractServerMs(null);
+    setExtractTimerPhase("idle");
+  };
+
   // Silent connection verification whenever selectedProvider changes
   useEffect(() => {
     const controller = new AbortController();
@@ -199,7 +313,7 @@ export default function SovereignChat() {
       setPreflightSuccess(null);
       
       try {
-        const res = await fetch(`${API_BASE_URL}/preflight-check`, {
+        const res = await fetch(`${getApiUrl()}/preflight-check`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ provider: selectedProvider }),
@@ -274,21 +388,28 @@ export default function SovereignChat() {
       const formData = new FormData();
       formData.append("file", file);
 
+      startExtractTimer();
       try {
-        const res = await fetch(`${API_BASE_URL}/extract-text`, {
+        const res = await fetch(`${getApiUrl()}/extract-text`, {
           method: "POST",
           body: formData,
         });
 
-        if (!res.ok) throw new Error("فشل استخراج النص من المرجع اللغوي.");
+        if (!res.ok) {
+          throw new Error(await readApiError(res, "فشل استخراج النص من المرجع اللغوي."));
+        }
         const data = await res.json();
-        
+        const serverMs = parseServerExtractMs(res);
+
         setUploadedFiles(prev => prev.map(f => f.id === fileId ? { ...f, content: data.text, status: "success" } : f));
         setPrimaryText(data.text);
-      } catch (err: any) {
+        finishExtractTimer(true, serverMs);
+      } catch (err: unknown) {
+        const errMsg = fetchApiError(err, "/extract-text");
         console.error("Primary text extraction failed:", err);
-        setUploadedFiles(prev => prev.map(f => f.id === fileId ? { ...f, status: "error", errorMsg: err.message } : f));
-        setPrimaryText(`❌ حدث خطأ أثناء القراءة: ${err.message || "فشلت عملية القراءة"}`);
+        setUploadedFiles(prev => prev.map(f => f.id === fileId ? { ...f, status: "error", errorMsg: errMsg } : f));
+        setPrimaryText(`❌ حدث خطأ أثناء القراءة: ${errMsg}`);
+        finishExtractTimer(false);
       }
     } else {
       // Auxiliary drafts upload (up to 10 files)
@@ -317,19 +438,26 @@ export default function SovereignChat() {
         const formData = new FormData();
         formData.append("file", file);
 
+        startExtractTimer();
         try {
-          const res = await fetch(`${API_BASE_URL}/extract-text`, {
+          const res = await fetch(`${getApiUrl()}/extract-text`, {
             method: "POST",
             body: formData,
           });
 
-          if (!res.ok) throw new Error("فشل استخراج النص من الملف الفرعي.");
+          if (!res.ok) {
+            throw new Error(await readApiError(res, "فشل استخراج النص من الملف الفرعي."));
+          }
           const data = await res.json();
-          
+          const serverMs = parseServerExtractMs(res);
+
           setUploadedFiles(prev => prev.map(f => f.id === correspondingId ? { ...f, content: data.text, status: "success" } : f));
-        } catch (err: any) {
+          finishExtractTimer(true, serverMs);
+        } catch (err: unknown) {
+          const errMsg = fetchApiError(err, "/extract-text");
           console.error("Auxiliary text extraction failed for", file.name, err);
-          setUploadedFiles(prev => prev.map(f => f.id === correspondingId ? { ...f, status: "error", errorMsg: err.message } : f));
+          setUploadedFiles(prev => prev.map(f => f.id === correspondingId ? { ...f, status: "error", errorMsg: errMsg } : f));
+          finishExtractTimer(false);
         }
       });
     }
@@ -347,7 +475,7 @@ export default function SovereignChat() {
     
     try {
       const logs = [
-        "جاري فحص وتهيئة المستندات المرفوعة وتحديد أدوار الدمج...",
+        "جاري فحص وتهيئة المستندات وتحديد أدوار الدمج...",
         "جاري استدعاء محرك البحث واستخراج الأفكار الذرية من المسودات الرديفة...",
         "جاري مطابقة الأفكار المكتشفة مع النص المرجعي ورصد النواقص...",
         "جاري صياغة النص الهجين الشامل بأسلوب الصياغة المحدد وحرية الأسلوب الأدبي...",
@@ -374,7 +502,7 @@ export default function SovereignChat() {
           content: f.isPrimary ? primaryText : f.content
         }));
 
-      const res = await fetch(`${API_BASE_URL}/merge-drafts`, {
+      const res = await fetch(`${getHeavyApiUrl()}/merge-drafts`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -460,9 +588,9 @@ export default function SovereignChat() {
 
     try {
       const logs = [
-        TASK_LOADING_PRIMARY.summarize,
-        "جاري تحليل الفصول عبر Parser العنقودي...",
-        "جاري صهر الأفكار في استدعاءات Map-Reduce..."
+        "جاري تحليل الفصول عبر المحلل العنقودي...",
+        "جاري استخلاص الأفكار الجوهرية والكلمات المفتاحية...",
+        "جاري صهر النتائج في استدعاءات Map-Reduce...",
       ];
       setMergeLogs([logs[0]]);
       let logCounter = 1;
@@ -477,7 +605,7 @@ export default function SovereignChat() {
 
       const engine = forceEngine === "auto" ? selectedProvider : forceEngine;
 
-      const res = await fetch(`${API_BASE_URL}/summarize`, {
+      const res = await fetch(`${getHeavyApiUrl()}/summarize`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -491,8 +619,7 @@ export default function SovereignChat() {
       clearInterval(logInterval);
 
       if (!res.ok) {
-        const errorData = await res.json().catch(() => ({}));
-        throw new Error(errorData.detail || "فشل طلب التلخيص من الخادم.");
+        throw new Error(await readApiError(res, "فشل طلب التلخيص"));
       }
 
       const data = await res.json();
@@ -557,7 +684,6 @@ export default function SovereignChat() {
 
     try {
       const logs = [
-        TASK_LOADING_PRIMARY.consolidate,
         "جاري تحليل الفوضى البنائية داخل المخطوطة...",
         "جاري التجميع العنقودي وربط الشظايا بالمحاور...",
         "جاري الصهر الأسلوبي الديناميكي وعكس الهندسة الدلالية...",
@@ -576,7 +702,7 @@ export default function SovereignChat() {
 
       const engine = forceEngine === "auto" ? selectedProvider : forceEngine;
 
-      const res = await fetch(`${API_BASE_URL}/consolidate`, {
+      const res = await fetch(`${getHeavyApiUrl()}/consolidate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -652,51 +778,6 @@ export default function SovereignChat() {
     }
   };
 
-  const handleDownload = (content: string, id: string) => {
-    const element = document.createElement("a");
-    const file = new Blob([content], { type: 'text/plain;charset=utf-8' });
-    element.href = URL.createObjectURL(file);
-    element.download = `sovereign_output_${id}.txt`;
-    document.body.appendChild(element);
-    element.click();
-    document.body.removeChild(element);
-  };
-
-  const handleDownloadDocx = async () => {
-    if (!summaryResult) {
-      alert("لا توجد نتائج للتصدير. نفّذ الصهر أولاً.");
-      return;
-    }
-    try {
-      const res = await fetch(`${API_BASE_URL}/export/docx`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          discovered_structure: summaryResult,
-          title: "جوهر المخطوطة — مدونة الخليل",
-          source_filename: primaryFile?.name || undefined,
-        }),
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.detail || "فشل تصدير Word");
-      }
-      const blob = await res.blob();
-      const stamp = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "");
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `khalil_consolidation_${stamp}.docx`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    } catch (error: any) {
-      console.error("DOCX export error:", error);
-      alert(error.message || "تعذر تصدير مستند Word.");
-    }
-  };
-
   const handleNewChat = () => {
     if (window.confirm("هل أنت متأكد من بدء جلسة جديدة؟ سيتم مسح جميع الملفات والبيانات الحالية.")) {
       if (timerRef.current) {
@@ -704,6 +785,7 @@ export default function SovereignChat() {
         timerRef.current = null;
       }
       setElapsedTime(0);
+      resetExtractTimer();
       setMessages([]);
       setCopiedId(null);
       setActiveWorkspaceData(null);
@@ -784,17 +866,15 @@ export default function SovereignChat() {
   const isReadyToRun = isPrimaryLoaded && (hasSubDrafts === false || (hasSubDrafts === true && hasAuxFiles));
 
   return (
-    <div className="flex flex-col h-screen bg-[#020617] text-slate-100 font-sans selection:bg-[#f59e0b] selection:text-black relative overflow-hidden" dir="rtl">
+    <div className={cn("flex flex-col h-screen font-sans relative overflow-hidden transition-colors duration-300", tc.appShell)} dir="rtl">
       
-      {/* Global Royal Blur Background Lights */}
-      <div className="absolute top-0 right-0 w-96 h-96 bg-emerald-500/5 rounded-full blur-3xl pointer-events-none z-0" />
-      <div className="absolute bottom-0 left-0 w-96 h-96 bg-amber-500/5 rounded-full blur-3xl pointer-events-none z-0" />
+      <div className={cn("absolute top-0 right-0 w-96 h-96 rounded-full blur-3xl pointer-events-none z-0", tc.glowEmerald)} />
+      <div className={cn("absolute bottom-0 left-0 w-96 h-96 rounded-full blur-3xl pointer-events-none z-0", tc.glowAmber)} />
 
-      {/* Top Banner Header */}
-      <header className="p-5 border-b border-slate-800 flex items-center justify-between bg-gradient-to-l from-slate-900 via-emerald-950/20 to-slate-900 backdrop-blur z-40 shrink-0">
+      <header className={cn("p-5 border-b flex items-center justify-between backdrop-blur z-40 shrink-0 transition-colors duration-300", tc.header)}>
         <div className="flex items-center gap-5">
           <div className="flex items-center gap-3">
-            <div className="p-1.5 bg-slate-900/80 border border-amber-500/20 rounded-xl flex items-center justify-center overflow-hidden w-10 h-10 transition-all duration-300 hover:border-amber-500/40">
+            <div className={cn("p-1.5 rounded-xl flex items-center justify-center overflow-hidden w-10 h-10 transition-all duration-300 border", tc.logoBox)}>
               <img 
                 src="/logo.png" 
                 alt="شعار مدونة الخليل" 
@@ -802,10 +882,10 @@ export default function SovereignChat() {
               />
             </div>
             <div className="flex flex-col right-alignment select-none">
-              <h1 className="text-xl font-black text-transparent bg-clip-text bg-gradient-to-r from-amber-400 via-emerald-100 to-amber-200">
-                مدونة الخليل للتحرير اللغوي <span className="text-xs font-normal text-amber-500/70 font-mono">v4.5 SaaS</span>
+              <h1 className={cn("text-xl font-black", tc.titleGradient)}>
+                مدونة الخليل للتحرير اللغوي <span className={cn("text-xs font-normal font-mono", tc.versionBadge)}>v4.6 SaaS</span>
               </h1>
-              <p className="text-xs text-slate-400 mt-1 font-medium max-w-xl">
+              <p className={cn("mt-1 font-medium max-w-xl", tc.headerSubtitle, tc.subtitle)}>
                 مساعدك اللغوي لسبك الأفكار، دمج المسودات، والارتقاء بالمحتوى اللغوي بكفاءة بنائية و زمنية.
               </p>
             </div>
@@ -814,40 +894,74 @@ export default function SovereignChat() {
           {/* 1. صندوق حجم الكلمات المدخلة (Input Volume Card) */}
           {totalInputWords > 0 && (
             <div 
-              className="hidden md:flex flex-col text-right border-r border-slate-800 pr-4 select-none group relative cursor-help"
+              className={cn("hidden md:flex flex-col text-right border-r pr-4 select-none group relative cursor-help", tc.divider)}
               title={`الأساسية: ${primaryWords.toLocaleString()} كلمة • الفرعية: ${auxWords.toLocaleString()} كلمة`}
             >
-              <span className="text-[9px] text-slate-500 font-bold block">حجم المدخلات الإجمالي</span>
-              <span className="text-[11px] font-black text-amber-500/90 font-mono mt-0.5">
-                {totalInputWords.toLocaleString()} <span className="text-[9px] font-sans text-slate-400 font-medium">كلمة</span>
+              <span className={cn("block", tc.labelStat, tc.labelMuted)}>حجم المدخلات الإجمالي</span>
+              <span className={cn("font-black font-mono mt-0.5", tc.statValue, theme === "oatmeal" ? "text-amber-800" : "text-amber-500/90")}>
+                {totalInputWords.toLocaleString()} <span className={cn("font-sans font-medium", tc.uiCaption, tc.textSoft)}>كلمة</span>
               </span>
-              {/* Custom Tooltip */}
-              <div className="absolute top-10 right-0 z-50 hidden group-hover:block bg-slate-900 border border-amber-500/20 p-2.5 rounded-xl text-[9px] text-slate-300 w-44 shadow-2xl leading-relaxed">
+              <div className={cn("absolute top-10 right-0 z-50 hidden group-hover:block p-2.5 rounded-xl text-[9px] w-44 leading-relaxed border", tc.tooltip)}>
                 <div className="flex justify-between mb-1">
                   <span>النص المرجعي:</span>
-                  <span className="font-mono font-bold text-slate-200">{primaryWords.toLocaleString()}</span>
+                  <span className={cn("font-mono font-bold", tc.uiBody)}>{primaryWords.toLocaleString()}</span>
                 </div>
                 <div className="flex justify-between">
                   <span>النصوص الرديفة:</span>
-                  <span className="font-mono font-bold text-slate-200">{auxWords.toLocaleString()}</span>
+                  <span className={cn("font-mono font-bold", tc.uiBody)}>{auxWords.toLocaleString()}</span>
                 </div>
               </div>
             </div>
           )}
         </div>
 
-        {/* 2. عداد التحليل الزمني الحي (Live Execution Timer) */}
-        <div className="flex flex-col items-center select-none">
-          <span className="text-[9px] text-slate-500 font-bold block mb-0.5">ميقات السبك والتحوير الحي</span>
-          <div className={cn(
-            "text-sm font-black font-mono tracking-wider transition-colors duration-300",
-            processPhase === "idle" 
-              ? "text-slate-500/60" 
-              : processPhase === "processing" || processPhase === "preflight"
-              ? "text-amber-500 animate-pulse" 
-              : "text-emerald-400"
-          )}>
-            {formatTimer(elapsedTime)}
+        {/* 2. ميقاتا الاستخراج والسبك */}
+        <div className="flex items-center gap-5 select-none">
+          <div className="flex flex-col items-center">
+            <span className={cn("font-bold block mb-0.5", tc.labelStat, tc.labelMuted)}>
+              ميقات استخراج النص
+            </span>
+            <div
+              className={cn(
+                "font-black font-mono tracking-wider transition-colors duration-300",
+                theme === "oatmeal" ? "text-base" : "text-sm",
+                extractTimerPhase === "idle"
+                  ? tc.timerIdle
+                  : extractTimerPhase === "running"
+                    ? cn(tc.timerBusy, "animate-pulse")
+                    : extractTimerPhase === "error"
+                      ? tc.timerError
+                      : tc.timerDone,
+              )}
+            >
+              {formatTimer(extractElapsedMs)}
+            </div>
+            {extractServerMs != null && extractTimerPhase === "done" && (
+              <span className={cn("text-[10px] font-mono mt-0.5", tc.labelMuted)}>
+                خادم: {extractServerMs.toLocaleString("ar")} مللي ث
+              </span>
+            )}
+          </div>
+
+          <div className={cn("h-10 w-px shrink-0", tc.divider)} aria-hidden />
+
+          <div className="flex flex-col items-center">
+            <span className={cn("font-bold block mb-0.5", tc.labelStat, tc.labelMuted)}>
+              ميقات السبك والتحوير الحي
+            </span>
+            <div
+              className={cn(
+                "font-black font-mono tracking-wider transition-colors duration-300",
+                theme === "oatmeal" ? "text-base" : "text-sm",
+                processPhase === "idle"
+                  ? tc.timerIdle
+                  : processPhase === "processing" || processPhase === "preflight"
+                    ? cn(tc.timerBusy, "animate-pulse")
+                    : tc.timerDone,
+              )}
+            >
+              {formatTimer(elapsedTime)}
+            </div>
           </div>
         </div>
 
@@ -855,7 +969,7 @@ export default function SovereignChat() {
           {(displayTokenTotal > 0 ||
             ((operationMode === "summarize" || operationMode === "consolidate") &&
               processPhase === "completed")) && (
-            <div className="flex items-center gap-2 text-xs font-mono text-amber-400/80 bg-amber-500/5 px-3 py-1 rounded-full border border-amber-500/15">
+            <div className={cn("flex items-center gap-2 text-xs font-mono px-3 py-1 rounded-full border", tc.tokenPill)}>
               <Activity size={12} className="text-[#f59e0b]" />
               <span>
                 {displayTokenTotal.toLocaleString()} TKN
@@ -867,10 +981,11 @@ export default function SovereignChat() {
           )}
 
           {/* 3. نقل أدوات التحكم السيادية في النظام (System Control Buttons) */}
-          <div className="flex items-center gap-1.5 bg-black/20 p-0.5 rounded-xl border border-slate-800">
+          <div className={cn("flex items-center gap-1.5 p-0.5 rounded-xl border", tc.controlsBar)}>
+            <ThemeToggle />
             <button
               onClick={handleNewChat}
-              className="flex items-center gap-1.5 text-[10px] text-slate-300 hover:text-amber-400 hover:scale-[1.02] transition-all duration-300 cursor-pointer bg-slate-900 border border-slate-800 px-2.5 py-1.5 rounded-lg"
+              className={cn("flex items-center gap-1.5 text-[10px] hover:scale-[1.02] transition-all duration-300 cursor-pointer px-2.5 py-1.5 rounded-lg border", tc.btnGhost)}
               title="بدء جلسة جديدة"
             >
               <RefreshCw size={11} />
@@ -881,6 +996,7 @@ export default function SovereignChat() {
               onClick={() => {
                 if (window.confirm("هل أنت متأكد من رغبتك في الخروج الآمن؟ سيتم إعادة تعيين كافة البيانات وإغلاق الجلسة.")) {
                   if (timerRef.current) clearInterval(timerRef.current);
+                  resetExtractTimer();
                   setMessages([]);
                   setCopiedId(null);
                   setActiveWorkspaceData(null);
@@ -904,12 +1020,12 @@ export default function SovereignChat() {
             </button>
           </div>
 
-          <div className="flex items-center gap-1.5 text-xs text-slate-500 border-r border-slate-800 pr-4">
-            <div className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+          <div className={cn("flex items-center gap-1.5 border-r pr-4", tc.statusActiveWrap, tc.divider)}>
+            <div className="relative flex h-2.5 w-2.5">
+              <span className={cn("animate-ping absolute inline-flex h-full w-full rounded-full", tc.statusActivePing)}></span>
+              <span className={cn("relative inline-flex rounded-full h-2.5 w-2.5", tc.statusActiveDot)}></span>
             </div>
-            <span className="font-semibold text-slate-400">نشط</span>
+            <span className={tc.statusActiveText}>نشط</span>
           </div>
         </div>
       </header>
@@ -920,12 +1036,12 @@ export default function SovereignChat() {
         {/* ========================================================================= */}
         {/* 1. RIGHT PANE: CONTROL & CONFIG PANE (22-25% width on desktop)            */}
         {/* ========================================================================= */}
-        <div className="w-full lg:w-[320px] xl:w-[360px] shrink-0 border-l border-slate-800 bg-slate-950/80 backdrop-blur flex flex-col overflow-y-auto z-10">
+        <div className={cn("w-full lg:w-[320px] xl:w-[360px] shrink-0 border-l backdrop-blur flex flex-col overflow-y-auto z-10 transition-colors duration-300", tc.pane)}>
           <div className="p-5 flex-1 flex flex-col justify-between">
             <div className="space-y-6">
               
-              <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-                <h3 className="text-sm font-extrabold text-slate-200 flex items-center gap-2 font-sans">
+              <div className={cn("flex items-center justify-between border-b pb-3", tc.divider)}>
+                <h3 className={cn("text-sm font-extrabold flex items-center gap-2 font-sans", tc.centerTitle)}>
                   <Layers size={16} className="text-[#f59e0b]" />
                   <span>لوحة التوجيه والتحكم</span>
                 </h3>
@@ -938,15 +1054,16 @@ export default function SovereignChat() {
                   
                   {/* Step 1: Model Provider Choice */}
                   <div className="space-y-1.5">
-                    <span className="text-[11px] font-bold text-amber-500 block font-sans">الخطوة 1: اختيار المحرر الذكي</span>
-                    <div className="grid grid-cols-2 gap-1 bg-slate-900 p-0.5 rounded-xl border border-slate-800">
+                    <span className={cn("block font-sans", tc.stepLabel)}>الخطوة 1: اختيار المحرر الذكي</span>
+                    <div className={cn("grid grid-cols-2 gap-1 p-0.5 rounded-xl border", tc.gridToggle)}>
                       <button
                         onClick={() => setSelectedProvider("deepseek")}
                         className={cn(
-                          "py-1.5 rounded-xl text-[10px] font-bold text-center transition-all duration-300 cursor-pointer",
+                          "py-1.5 rounded-xl font-bold text-center transition-all duration-300 cursor-pointer",
+                          tc.toggleText,
                           selectedProvider === "deepseek"
-                            ? "bg-amber-950/40 text-amber-500 border border-amber-500/30 ring-1 ring-amber-500/30 shadow-md font-black"
-                            : "text-slate-500 hover:text-slate-300 hover:scale-[1.02]"
+                            ? tc.toggleActive
+                            : cn(tc.toggleIdle, "hover:scale-[1.02]")
                         )}
                       >
                         DeepSeek-V3
@@ -954,10 +1071,11 @@ export default function SovereignChat() {
                       <button
                         onClick={() => setSelectedProvider("gemini")}
                         className={cn(
-                          "py-1.5 rounded-xl text-[10px] font-bold text-center transition-all duration-300 cursor-pointer",
+                          "py-1.5 rounded-xl font-bold text-center transition-all duration-300 cursor-pointer",
+                          tc.toggleText,
                           selectedProvider === "gemini"
-                            ? "bg-amber-950/40 text-amber-500 border border-amber-500/30 ring-1 ring-amber-500/30 shadow-md font-black"
-                            : "text-slate-500 hover:text-slate-300 hover:scale-[1.02]"
+                            ? tc.toggleActive
+                            : cn(tc.toggleIdle, "hover:scale-[1.02]")
                         )}
                       >
                         Gemini Flash
@@ -965,7 +1083,7 @@ export default function SovereignChat() {
                     </div>
                     {/* Connection check status indicator */}
                     {checkingProvider && (
-                      <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl text-[10px] text-slate-400 flex items-center justify-center gap-2 mt-2">
+                      <div className={cn("p-3 rounded-xl flex items-center justify-center gap-2 mt-2 border", tc.statusChecking)}>
                         <span className="relative flex h-2 w-2">
                           <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
                           <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-400"></span>
@@ -974,14 +1092,14 @@ export default function SovereignChat() {
                       </div>
                     )}
                     {preflightError && (
-                      <div className="p-3 bg-red-950/20 border border-red-500/30 rounded-xl text-[10px] text-red-400 flex items-start gap-2 mt-2">
+                      <div className={cn("p-3 rounded-xl flex items-start gap-2 mt-2 border", tc.statusError)}>
                         <AlertTriangle size={14} className="shrink-0 mt-0.5" />
                         <p className="leading-relaxed">{preflightError}</p>
                       </div>
                     )}
                     {preflightSuccess && (
-                      <div className="p-3 bg-emerald-950/20 border border-emerald-500/30 rounded-xl text-[10px] text-emerald-400 flex items-start gap-2 mt-2">
-                        <CheckCircle2 size={14} className="shrink-0 mt-0.5" />
+                      <div className={cn("p-3 rounded-xl flex items-start gap-2 mt-2 border", tc.statusSuccess)}>
+                        <CheckCircle2 size={14} className={cn("mt-0.5", tc.statusSuccessIcon)} />
                         <p className="leading-relaxed">{preflightSuccess}</p>
                       </div>
                     )}
@@ -989,12 +1107,12 @@ export default function SovereignChat() {
 
                   {/* Step 2: Upload Primary Document */}
                   <div className="space-y-2">
-                    <span className="text-[11px] font-bold text-amber-500 block font-sans">الخطوة 2: النص المرجعي (المصدر الأساسي)</span>
+                    <span className={cn("block font-sans", tc.stepLabel)}>الخطوة 2: النص المرجعي (المصدر الأساسي)</span>
                     
                     {!primaryFile ? (
                       <div 
                         onClick={() => primaryFileInputRef.current?.click()}
-                        className="border border-dashed border-amber-500/30 hover:border-amber-500 bg-slate-900/40 hover:bg-amber-500/5 hover:scale-[1.02] transition-all duration-300 rounded-2xl p-6 flex flex-col items-center justify-center gap-2.5 cursor-pointer group shadow-sm hover:shadow-md"
+                        className={cn("border border-dashed border-amber-500/30 hover:border-amber-500 hover:bg-amber-500/5 hover:scale-[1.02] transition-all duration-300 rounded-2xl p-6 flex flex-col items-center justify-center gap-2.5 cursor-pointer group shadow-sm hover:shadow-md", tc.uploadZone)}
                       >
                         <input
                           type="file"
@@ -1008,28 +1126,28 @@ export default function SovereignChat() {
                         />
                         <UploadCloud size={24} className="text-amber-500/70 group-hover:scale-105 transition-transform" />
                         <div className="text-center">
-                          <p className="text-xs font-bold text-slate-300">إيداع النص المرجعي الأساسي</p>
-                          <p className="text-[9px] text-slate-500 mt-1 leading-relaxed">docx · pdf · txt · md · json · rtf</p>
+                          <p className={cn("font-bold", tc.uploadTitle)}>إيداع النص المرجعي الأساسي</p>
+                          <p className={cn("mt-1 leading-relaxed", tc.uploadHint)}>docx · pdf · txt · md · json · rtf</p>
                         </div>
                       </div>
                     ) : (
                       // Primary File Status Card
-                      <div className="p-3.5 bg-slate-900 border border-emerald-500/20 rounded-2xl flex items-center justify-between gap-3 relative overflow-hidden shadow-lg">
+                      <div className={cn("p-3.5 rounded-2xl flex items-center justify-between gap-3 relative overflow-hidden", tc.primaryFileCard)}>
                         <div className="absolute top-0 right-0 w-20 h-20 bg-emerald-500/5 rounded-full blur-xl pointer-events-none" />
                         <div className="flex items-center gap-3 min-w-0">
-                          <div className="p-2 bg-emerald-500/10 text-emerald-400 rounded-xl shrink-0">
+                          <div className={cn("p-2 rounded-xl shrink-0", tc.primaryFileIcon)}>
                             <Crown size={16} />
                           </div>
                           <div className="min-w-0">
-                            <h4 className="text-xs font-bold text-slate-200 truncate">{primaryFile.name}</h4>
-                            <p className="text-[9px] text-slate-500 font-mono mt-0.5">{(primaryFile.size / 1024).toFixed(1)} KB</p>
+                            <h4 className={cn("truncate", tc.primaryFileTitle)}>{primaryFile.name}</h4>
+                            <p className={cn("font-mono mt-0.5", tc.primaryFileMeta)}>{(primaryFile.size / 1024).toFixed(1)} KB</p>
                           </div>
                         </div>
 
                         <div className="flex items-center gap-2 shrink-0">
                           {primaryFile.status === "loading" && <RefreshCw size={12} className="animate-spin text-amber-500" />}
                           {primaryFile.status === "error" && <span title={primaryFile.errorMsg}><AlertTriangle size={12} className="text-red-400" /></span>}
-                          {primaryFile.status === "success" && <CheckCircle2 size={12} className="text-emerald-400" />}
+                          {primaryFile.status === "success" && <CheckCircle2 size={12} className={theme === "oatmeal" ? "text-emerald-700" : "text-emerald-400"} />}
                           
                           <button 
                             onClick={() => {
@@ -1037,7 +1155,11 @@ export default function SovereignChat() {
                               setPrimaryText("");
                               setHasSubDrafts(null);
                             }}
-                            className="p-1 hover:bg-red-950/30 text-slate-500 hover:text-red-400 rounded-xl transition-colors border border-slate-800 bg-[#020617]"
+                            className={cn(
+                              "p-1 rounded-xl transition-colors border",
+                              tc.btnGhost,
+                              "hover:bg-red-50 hover:text-red-600 hover:border-red-300",
+                            )}
                             title="إزالة المستند"
                           >
                             <Trash2 size={12} />
@@ -1049,16 +1171,15 @@ export default function SovereignChat() {
 
                   {/* Step 3: Choose operation mode and show options accordingly */}
                   {isPrimaryLoaded && (
-                    <div className="space-y-4 pt-1 border-t border-slate-800">
-                      <span className="text-[11px] font-bold text-amber-500 block font-sans">اختر نوع العملية</span>
-                      <div className="grid grid-cols-3 gap-1 bg-slate-900 p-0.5 rounded-xl border border-slate-800">
+                    <div className={cn("space-y-4 pt-1 border-t", tc.sectionDivider)}>
+                      <span className={cn("block font-sans", tc.stepLabel)}>اختر نوع العملية</span>
+                      <div className={cn("grid grid-cols-3 gap-1 p-0.5 rounded-xl border", tc.gridToggle)}>
                         <button
                           onClick={() => setOperationMode("summarize")}
                           className={cn(
-                            "py-1.5 rounded-lg text-[9px] font-bold text-center transition-all duration-300 cursor-pointer leading-snug",
-                            operationMode === "summarize"
-                              ? "bg-amber-950/40 text-amber-500 border border-amber-500/30 ring-1 ring-amber-500/30 shadow-md font-black"
-                              : "text-slate-500 hover:text-slate-300 hover:scale-[1.02]"
+                            "py-1.5 rounded-lg font-bold text-center transition-all duration-300 cursor-pointer leading-snug",
+                            tc.toggleTextSm,
+                            operationMode === "summarize" ? tc.toggleActive : tc.toggleIdle,
                           )}
                         >
                           تلخيص دلالي
@@ -1066,10 +1187,9 @@ export default function SovereignChat() {
                         <button
                           onClick={() => setOperationMode("edit")}
                           className={cn(
-                            "py-1.5 rounded-lg text-[9px] font-bold text-center transition-all duration-300 cursor-pointer leading-snug",
-                            operationMode === "edit"
-                              ? "bg-amber-950/40 text-amber-500 border border-amber-500/30 ring-1 ring-amber-500/30 shadow-md font-black"
-                              : "text-slate-500 hover:text-slate-300 hover:scale-[1.02]"
+                            "py-1.5 rounded-lg font-bold text-center transition-all duration-300 cursor-pointer leading-snug",
+                            tc.toggleTextSm,
+                            operationMode === "edit" ? tc.toggleActive : tc.toggleIdle,
                           )}
                         >
                           تحرير ودمج
@@ -1077,22 +1197,21 @@ export default function SovereignChat() {
                         <button
                           onClick={() => setOperationMode("consolidate")}
                           className={cn(
-                            "py-1.5 rounded-lg text-[9px] font-bold text-center transition-all duration-300 cursor-pointer leading-snug",
-                            operationMode === "consolidate"
-                              ? "bg-amber-950/40 text-amber-500 border border-amber-500/30 ring-1 ring-amber-500/30 shadow-md font-black"
-                              : "text-slate-500 hover:text-slate-300 hover:scale-[1.02]"
+                            "py-1.5 rounded-lg font-bold text-center transition-all duration-300 cursor-pointer leading-snug",
+                            tc.toggleTextSm,
+                            operationMode === "consolidate" ? tc.toggleActive : tc.toggleIdle,
                           )}
                         >
                           صهر المحاور
                         </button>
                       </div>
                       {operationMode === "summarize" && (
-                        <p className="text-[9px] text-slate-500 leading-relaxed">
+                        <p className={cn("leading-relaxed", tc.uiCaption)}>
                           استخلاص أفكار جوهرية وكلمات مفتاحية — استدعاء LLM واحد تقريباً.
                         </p>
                       )}
                       {operationMode === "consolidate" && (
-                        <p className="text-[9px] text-amber-500/80 leading-relaxed">
+                        <p className={cn("leading-relaxed text-amber-800", tc.uiCaption)}>
                           متقدم: دمج الفوضى في 7 محاور — يتطلب ملف الأصل JSON.
                         </p>
                       )}
@@ -1102,16 +1221,19 @@ export default function SovereignChat() {
                   {isPrimaryLoaded && operationMode === "edit" && (
                     <>
                       {/* Step 3: Choose Sub-drafts option (Visible if primary uploaded successfully) */}
-                      <div className="space-y-3.5 pt-4 border-t border-slate-800/40">
-                        <span className="text-[11px] font-bold text-amber-500 block font-sans">الخطوة 3: النصوص الرديفة والدمج</span>
+                      <div className={cn("space-y-3.5 pt-4 border-t", tc.sectionDivider)}>
+                        <span className={cn("block font-sans", tc.stepLabel)}>الخطوة 3: النصوص الرديفة والدمج</span>
                         
                         {hasSubDrafts === null ? (
                           <div className="space-y-2">
-                            <p className="text-[10px] text-slate-400 leading-relaxed font-sans">هل لديك نصوص رديفة ترغب في دمج أفكارها ومقترحاتها مع النص المرجعي؟</p>
+                            <p className={cn("font-sans", tc.hintText)}>هل لديك نصوص رديفة ترغب في دمج أفكارها ومقترحاتها مع النص المرجعي؟</p>
                             <div className="grid grid-cols-2 gap-2">
                               <button
                                 onClick={() => setHasSubDrafts(true)}
-                                className="py-2 px-3 bg-amber-950/40 hover:bg-amber-500/20 text-amber-500 border border-amber-500/30 rounded-xl text-xs font-bold transition-all duration-300 cursor-pointer hover:scale-[1.02]"
+                                className={cn(
+                                  "py-2 px-3 rounded-xl text-xs font-bold border transition-all duration-300 cursor-pointer hover:scale-[1.02]",
+                                  tc.btnAccent,
+                                )}
                               >
                                 نعم، دمج نصوص رديفة
                               </button>
@@ -1120,7 +1242,10 @@ export default function SovereignChat() {
                                   setHasSubDrafts(false);
                                   setUploadedFiles(prev => prev.filter(f => f.isPrimary)); // Clear any aux if none wanted
                                 }}
-                                className="py-2 px-3 bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 rounded-xl text-xs font-bold transition-all duration-300 cursor-pointer hover:scale-[1.02]"
+                                className={cn(
+                                  "py-2 px-3 rounded-xl text-xs font-bold border transition-all duration-300 cursor-pointer hover:scale-[1.02]",
+                                  tc.btnSecondary,
+                                )}
                               >
                                 لا، النص المرجعي فقط
                               </button>
@@ -1131,7 +1256,10 @@ export default function SovereignChat() {
                           <div className="space-y-3">
                             <div 
                               onClick={() => auxFileInputRef.current?.click()}
-                              className="border border-dashed border-slate-800 hover:border-amber-500 bg-slate-900/40 hover:bg-amber-500/5 hover:scale-[1.02] transition-all duration-300 rounded-2xl p-4 flex flex-col items-center justify-center gap-2 cursor-pointer shadow-sm hover:shadow-md"
+                              className={cn(
+                                "border border-dashed hover:border-amber-500 hover:scale-[1.02] transition-all duration-300 rounded-2xl p-4 flex flex-col items-center justify-center gap-2 cursor-pointer shadow-sm hover:shadow-md",
+                                tc.uploadZone,
+                              )}
                             >
                               <input
                                 type="file"
@@ -1144,10 +1272,10 @@ export default function SovereignChat() {
                                 multiple
                                 className="hidden"
                               />
-                              <Paperclip size={16} className="text-slate-500" />
+                              <Paperclip size={16} className={tc.textMuted} />
                               <div className="text-center">
-                                <p className="text-[11px] font-bold text-slate-300">إيداع النصوص الرديفة الإضافية</p>
-                                <p className="text-[8px] text-slate-500 mt-0.5">حتى 10 ملفات — docx · pdf · txt · md · json · rtf</p>
+                                <p className={cn("font-bold", tc.uploadTitle)}>إيداع النصوص الرديفة الإضافية</p>
+                                <p className={cn("mt-0.5", tc.uploadHint)}>حتى 10 ملفات — docx · pdf · txt · md · json · rtf</p>
                               </div>
                             </div>
 
@@ -1155,17 +1283,17 @@ export default function SovereignChat() {
                             {hasAuxFiles && (
                               <div className="space-y-2 max-h-36 overflow-y-auto pr-1">
                                 {uploadedFiles.filter(f => !f.isPrimary).map(file => (
-                                  <div key={file.id} className="p-2 bg-slate-900 border border-slate-800 rounded-xl flex items-center justify-between gap-2">
+                                  <div key={file.id} className={cn("p-2 rounded-xl border flex items-center justify-between gap-2", tc.fileRow)}>
                                     <div className="flex items-center gap-2 min-w-0">
-                                      <FileText size={12} className="text-slate-400 shrink-0" />
-                                      <span className="text-[10px] text-slate-300 truncate">{file.name}</span>
+                                      <FileText size={12} className={cn("shrink-0", tc.textMuted)} />
+                                      <span className={cn("text-xs truncate", tc.uiBody)}>{file.name}</span>
                                     </div>
                                     <div className="flex items-center gap-1.5 shrink-0">
                                       {file.status === "loading" && <RefreshCw size={10} className="animate-spin text-amber-500" />}
-                                      {file.status === "success" && <CheckCircle2 size={10} className="text-emerald-400" />}
+                                      {file.status === "success" && <CheckCircle2 size={10} className={theme === "oatmeal" ? "text-emerald-700" : "text-emerald-400"} />}
                                       <button
                                         onClick={() => setUploadedFiles(prev => prev.filter(f => f.id !== file.id))}
-                                        className="text-slate-500 hover:text-red-400 transition-colors"
+                                        className={cn("transition-colors", tc.textMuted, "hover:text-red-500")}
                                       >
                                         <Trash2 size={10} />
                                       </button>
@@ -1184,8 +1312,8 @@ export default function SovereignChat() {
                           </div>
                         ) : (
                           // Individual refinement mode card
-                          <div className="p-3 bg-amber-950/40 border border-amber-500/30 rounded-xl flex items-center justify-between shadow-inner">
-                            <span className="text-xs text-amber-300 font-semibold font-sans">وضع التهذيب الفردي مفعل</span>
+                          <div className={cn("p-3 rounded-xl border flex items-center justify-between", tc.modeBanner)}>
+                            <span className="text-xs font-semibold font-sans">وضع التهذيب الفردي مفعل</span>
                             <button 
                               onClick={() => setHasSubDrafts(null)}
                               className="text-[9px] text-[#f59e0b] hover:underline"
@@ -1197,11 +1325,11 @@ export default function SovereignChat() {
                       </div>
 
                       {/* Global Configurations (Style, Word target) */}
-                      <div className="space-y-4 pt-4 border-t border-slate-800/40">
+                      <div className={cn("space-y-4 pt-4 border-t", tc.sectionDivider)}>
                         {/* Writing Style */}
                         <div className="space-y-1.5">
-                          <span className="text-[11px] font-bold text-amber-500 block font-sans">الأسلوب اللغوي</span>
-                          <div className="grid grid-cols-2 gap-1.5">
+                          <span className={cn("block font-sans", tc.stepLabel)}>الأسلوب اللغوي</span>
+                          <div className={cn("grid grid-cols-2 gap-1.5 p-0.5 rounded-xl border", tc.gridToggle)}>
                             {[
                               { id: "academic", label: "أكاديمي" },
                               { id: "legal", label: "قانوني" },
@@ -1212,10 +1340,9 @@ export default function SovereignChat() {
                                 key={s.id}
                                 onClick={() => setSelectedStyle(s.id)}
                                 className={cn(
-                                  "py-1.5 px-2 rounded-xl text-xs font-bold text-center border transition-all duration-300 hover:scale-[1.02] cursor-pointer",
-                                  selectedStyle === s.id
-                                    ? "bg-amber-950/40 border-amber-500/30 ring-1 ring-amber-500/30 text-amber-500 font-extrabold shadow-lg shadow-amber-500/5"
-                                    : "bg-slate-900 border-slate-800 text-slate-400 hover:text-white"
+                                  "py-1.5 px-2 rounded-xl font-bold text-center border transition-all duration-300 hover:scale-[1.02] cursor-pointer",
+                                  tc.toggleText,
+                                  selectedStyle === s.id ? tc.toggleActive : tc.pillIdle,
                                 )}
                               >
                                 {s.label}
@@ -1226,26 +1353,32 @@ export default function SovereignChat() {
 
                         {/* Target Word Count */}
                         <div className="space-y-1.5">
-                          <span className="text-[11px] font-bold text-slate-300 block font-sans">الكلمات المستهدفة (اختياري)</span>
+                          <span className={cn("block font-sans", tc.stepLabelMuted)}>الكلمات المستهدفة (اختياري)</span>
                           <input 
                             type="number"
                             value={targetWordCount}
                             onChange={(e) => setTargetWordCount(e.target.value)}
                             placeholder="مثال: 1000 كلمة"
-                            className="w-full bg-slate-900 border border-slate-800 focus:border-amber-500 focus:ring-1 focus:ring-amber-500/30 rounded-xl py-1.5 px-3 focus:outline-none text-right font-mono text-xs text-slate-300 placeholder:text-slate-500"
+                            className={cn(
+                              "w-full rounded-xl py-1.5 px-3 focus:outline-none text-right font-mono text-xs focus:ring-1",
+                              tc.inputField,
+                            )}
                           />
                         </div>
 
                         {/* Custom Intent Steering */}
-                        <div className="space-y-1.5 pt-1.5 border-t border-slate-800/40">
-                          <span className="text-[11px] font-bold text-amber-500 block font-sans">
+                        <div className={cn("space-y-1.5 pt-1.5 border-t", tc.sectionDivider)}>
+                          <span className={cn("block font-sans", tc.stepLabelMuted)}>
                             التوجيه المخصص (اختياري)
                           </span>
                           <textarea
                             value={customIntent}
                             onChange={(e) => setCustomIntent(e.target.value)}
                             placeholder="اكتب هنا توجيهاتك الخاصة للمخطوطة (مثال: صياغة الأفكار الإدارية في قالب قصصي أدبي مترابط)..."
-                            className="w-full bg-slate-900 border border-slate-800 focus:border-amber-500 focus:ring-1 focus:ring-amber-500/30 rounded-xl p-3 text-right font-sans text-xs text-slate-300 placeholder:text-slate-500 resize-none min-h-[85px] focus:outline-none"
+                            className={cn(
+                              "w-full rounded-xl p-3 text-right font-sans text-xs resize-none min-h-[85px] focus:outline-none focus:ring-1",
+                              tc.inputField,
+                            )}
                           />
                         </div>
                       </div>
@@ -1253,11 +1386,11 @@ export default function SovereignChat() {
                   )}
 
                   {isPrimaryLoaded && (operationMode === "summarize" || operationMode === "consolidate") && (
-                    <div className="space-y-4 pt-4 border-t border-slate-800/40">
+                    <div className={cn("space-y-4 pt-4 border-t", tc.sectionDivider)}>
                       {operationMode === "consolidate" && (
                         <>
                           <div className="space-y-1.5">
-                            <span className="text-[11px] font-bold text-amber-500 block font-sans">ملف الأصل المرجعي (JSON — إلزامي)</span>
+                            <span className={cn("block font-sans", tc.stepLabel)}>ملف الأصل المرجعي (JSON — إلزامي)</span>
                             <input
                               type="file"
                               accept=".json"
@@ -1268,41 +1401,46 @@ export default function SovereignChat() {
                                 setReferenceJson(text);
                                 e.target.value = "";
                               }}
-                              className="w-full text-[10px] text-slate-400 file:mr-2 file:py-1 file:px-2 file:rounded-lg file:border-0 file:bg-amber-950/40 file:text-amber-500 file:font-bold file:cursor-pointer"
+                              className={cn(
+                                "w-full file:mr-2 file:py-1 file:px-2 file:rounded-lg file:border file:font-bold file:cursor-pointer",
+                                tc.fileInput,
+                              )}
                             />
                             {referenceJson && (
-                              <p className="text-[9px] text-emerald-400 font-sans">✓ تم تحميل المرجع ({Math.round(referenceJson.length / 1024)} KB)</p>
+                              <p className={cn("font-sans", tc.referenceJsonOk)}>✓ تم تحميل المرجع ({Math.round(referenceJson.length / 1024)} KB)</p>
                             )}
                           </div>
                           <div className="space-y-1.5">
-                            <span className="text-[11px] font-bold text-slate-300 block font-sans">توجيه الصهر (اختياري)</span>
+                            <span className={cn("block font-sans", tc.stepLabelMuted)}>توجيه الصهر (اختياري)</span>
                             <textarea
                               value={customIntent}
                               onChange={(e) => setCustomIntent(e.target.value)}
                               placeholder="مثال: ركّز على السرد القصصي دون تكرار..."
-                              className="w-full bg-slate-900 border border-slate-800 focus:border-amber-500 focus:ring-1 focus:ring-amber-500/30 rounded-xl p-3 text-right font-sans text-xs text-slate-300 placeholder:text-slate-500 resize-none min-h-[70px] focus:outline-none"
+                              className={cn(
+                                "w-full rounded-xl p-3 text-right font-sans text-xs resize-none min-h-[70px] focus:outline-none focus:ring-1",
+                                tc.inputField,
+                              )}
                             />
                           </div>
                         </>
                       )}
 
                       {operationMode === "summarize" && (
-                        <p className="text-[9px] text-slate-500 leading-relaxed">
+                        <p className={cn("leading-relaxed", tc.uiCaption)}>
                           استدعاء LLM واحد تقريباً — مناسب للنصوص الطويلة دون ملف مرجعي.
                         </p>
                       )}
 
                       {/* Export Format + Engine — مشترك */}
-                      <div className="space-y-1.5 pt-1.5 border-t border-slate-800/40">
-                        <span className="text-[11px] font-bold text-slate-300 block font-sans">صيغة المخرجات</span>
-                        <div className="grid grid-cols-2 gap-2 bg-slate-900 p-0.5 rounded-xl border border-slate-800">
+                      <div className={cn("space-y-1.5 pt-1.5 border-t", tc.sectionDivider)}>
+                        <span className={cn("block font-sans", tc.stepLabelMuted)}>صيغة المخرجات</span>
+                        <div className={cn("grid grid-cols-2 gap-2 p-0.5 rounded-xl border", tc.gridToggle)}>
                           <button
                             onClick={() => setSummaryFormat("json")}
                             className={cn(
-                              "py-1.5 rounded-lg text-[10px] font-bold text-center transition-all duration-300 cursor-pointer",
-                              summaryFormat === "json"
-                                ? "bg-amber-950/40 text-amber-500 border border-amber-500/30 ring-1 ring-amber-500/30 shadow-md font-black"
-                                : "text-slate-500 hover:text-slate-300 hover:scale-[1.02]"
+                              "py-1.5 rounded-lg font-bold text-center transition-all duration-300 cursor-pointer",
+                              tc.toggleText,
+                              summaryFormat === "json" ? tc.toggleActive : tc.toggleIdle,
                             )}
                           >
                             JSON الهيكلي
@@ -1310,10 +1448,9 @@ export default function SovereignChat() {
                           <button
                             onClick={() => setSummaryFormat("markdown")}
                             className={cn(
-                              "py-1.5 rounded-lg text-[10px] font-bold text-center transition-all duration-300 cursor-pointer",
-                              summaryFormat === "markdown"
-                                ? "bg-amber-950/40 text-amber-500 border border-amber-500/30 ring-1 ring-amber-500/30 shadow-md font-black"
-                                : "text-slate-500 hover:text-slate-300 hover:scale-[1.02]"
+                              "py-1.5 rounded-lg font-bold text-center transition-all duration-300 cursor-pointer",
+                              tc.toggleText,
+                              summaryFormat === "markdown" ? tc.toggleActive : tc.toggleIdle,
                             )}
                           >
                             Markdown منسق
@@ -1322,9 +1459,9 @@ export default function SovereignChat() {
                       </div>
 
                       {/* Preferred Engine Toggle */}
-                      <div className="space-y-1.5 pt-1.5 border-t border-slate-800/40">
-                        <span className="text-[11px] font-bold text-slate-300 block font-sans">تفضيل المحرك</span>
-                        <div className="grid grid-cols-3 gap-1 bg-slate-900 p-0.5 rounded-xl border border-slate-800">
+                      <div className={cn("space-y-1.5 pt-1.5 border-t", tc.sectionDivider)}>
+                        <span className={cn("block font-sans", tc.stepLabelMuted)}>تفضيل المحرك</span>
+                        <div className={cn("grid grid-cols-3 gap-1 p-0.5 rounded-xl border", tc.gridToggle)}>
                           {[
                             { id: "auto", label: "تلقائي" },
                             { id: "deepseek", label: "DeepSeek" },
@@ -1334,10 +1471,9 @@ export default function SovereignChat() {
                               key={e.id}
                               onClick={() => setForceEngine(e.id)}
                               className={cn(
-                                "py-1.5 rounded-lg text-[9px] font-bold text-center transition-all duration-300 cursor-pointer",
-                                forceEngine === e.id
-                                  ? "bg-amber-950/40 text-amber-500 border border-amber-500/30 ring-1 ring-amber-500/30 shadow-md font-black"
-                                  : "text-slate-500 hover:text-slate-300 hover:scale-[1.02]"
+                                "py-1.5 rounded-lg font-bold text-center transition-all duration-300 cursor-pointer",
+                                tc.toggleTextSm,
+                                forceEngine === e.id ? tc.toggleActive : tc.toggleIdle,
                               )}
                             >
                               {e.label}
@@ -1350,80 +1486,31 @@ export default function SovereignChat() {
 
                 </div>
               ) : processPhase === "processing" || processPhase === "preflight" ? (
-                // Localized Loading View inside control pane (Middle pane stays visible!)
-                <div className="space-y-6 py-10 flex flex-col items-center">
-                  <div className="relative w-16 h-16">
-                    <div className="absolute inset-0 rounded-full border-4 border-amber-500/10" />
-                    <div className="absolute inset-0 rounded-full border-4 border-t-amber-500 border-r-transparent border-b-transparent border-l-transparent animate-spin" />
-                    <div className="absolute inset-1.5 rounded-full border-2 border-emerald-500/10" />
-                    <div className="absolute inset-1.5 rounded-full border-2 border-b-emerald-400 border-t-transparent border-r-transparent border-l-transparent animate-spin [animation-duration:1.2s] [animation-direction:reverse]" />
-                    <div className="absolute inset-0 flex items-center justify-center">
-                      <Cpu size={20} className="text-amber-500 animate-pulse" />
-                    </div>
-                  </div>
-
-                  <div className="text-center space-y-1">
-                    <h4 className={cn("font-bold text-white font-sans", VIEWPORT_TEXT)}>
-                      {processPhase === "preflight"
-                        ? "جاري فحص اتصال الخوادم..."
-                        : TASK_LOADING_PRIMARY[operationMode]}
-                    </h4>
-                    <p className="text-[9px] text-slate-500 font-sans">
-                      {processPhase === "preflight"
-                        ? "يتم التحقق من مفتاح API وصلاحية الحساب"
-                        : operationMode === "summarize"
-                          ? "استخلاص الأفكار والكلمات المفتاحية في استدعاء واحد..."
-                          : operationMode === "consolidate"
-                            ? "دمج الفوضى البنائية في بطاقات المحاور السبعة..."
-                            : "يقوم وكلاء الأنظمة بعمليات المطابقة والدراسة..."}
-                    </p>
-                  </div>
-
-                  {/* Realtime logs viewport */}
-                  {mergeLogs.length > 0 && (
-                    <div className="w-full bg-black/40 border border-slate-800 rounded-2xl p-3.5 text-right space-y-2.5 font-mono text-[9px] text-slate-400 min-h-[140px] flex flex-col justify-end">
-                      {mergeLogs.map((log, index) => {
-                        const isLatest = index === mergeLogs.length - 1;
-                        return (
-                          <div 
-                            key={index} 
-                            className={cn(
-                              "flex items-start gap-2 transition-all duration-350",
-                              isLatest ? "text-amber-500 font-bold animate-pulse" : "text-slate-600"
-                            )}
-                          >
-                            <span className="mt-0.5 shrink-0">
-                              {isLatest ? (
-                                <span className="relative flex h-1.5 w-1.5">
-                                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
-                                  <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-amber-500"></span>
-                                </span>
-                              ) : (
-                                <CheckCircle2 size={10} className="text-emerald-500/80" />
-                              )}
-                            </span>
-                            <span className="flex-1 leading-relaxed">{log}</span>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
+                <div className="py-10 flex flex-col items-center justify-center text-center gap-4">
+                  <ProcessingBrandSpinner size="lg" />
+                  <h4 className={cn("font-bold font-sans", tc.stepLabel)}>
+                    {processPhase === "preflight"
+                      ? "جاري فحص الاتصال..."
+                      : operationMode === "summarize"
+                        ? "جاري تلخيص الوثيقة"
+                        : operationMode === "consolidate"
+                          ? "جاري صهر الوثيقة"
+                          : "جاري معالجة الوثيقة"}
+                  </h4>
                 </div>
               ) : (
                 // Phase 3: Completed State (Metrics Dashboard)
                 <div className="space-y-5">
                   {operationMode === "edit" ? (
                     <>
-                      <div className="bg-slate-900 p-3.5 rounded-2xl border border-slate-800 space-y-1.5 shadow-inner">
-                        <span className="text-[9px] text-slate-500 font-bold block">الملفات المستخدمة في الدمج</span>
+                      <div className={cn("p-3.5 rounded-2xl border space-y-1.5", tc.innerPanel)}>
+                        <span className={cn("font-bold block", tc.metricLabel)}>الملفات المستخدمة في الدمج</span>
                         <div className="space-y-1">
                           {uploadedFiles.map(file => (
-                            <div key={file.id} className="flex items-center justify-between text-[10px]">
-                              <span className="text-slate-300 truncate max-w-[170px] font-medium">{file.name}</span>
-                              <span className={cn("text-[8px] px-1.5 py-0.5 rounded font-bold border", 
-                                file.isPrimary 
-                                  ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/25" 
-                                  : "bg-amber-500/10 text-amber-400 border-amber-500/25"
+                            <div key={file.id} className="flex items-center justify-between text-xs">
+                              <span className={cn("truncate max-w-[170px] font-medium", tc.uiBody)}>{file.name}</span>
+                              <span className={cn("px-1.5 py-0.5 rounded font-bold border text-xs", 
+                                file.isPrimary ? tc.badgeRolePrimary : tc.badgeRoleAux
                               )}>
                                 {file.isPrimary ? "أساسي" : "فرعي"}
                               </span>
@@ -1434,30 +1521,30 @@ export default function SovereignChat() {
 
                       {/* Dynamic Metrics */}
                       <div className="space-y-2">
-                        <span className="text-[10px] font-bold text-slate-400 block font-sans">مؤشرات الأداء اللغوي</span>
+                        <span className={cn("block font-sans", tc.sectionLabel)}>مؤشرات الأداء اللغوي</span>
                         
                         <div className="grid grid-cols-2 gap-2">
-                          <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right">
-                            <span className="text-[8px] text-slate-500 block mb-0.5">التوكنات المستهلكة</span>
-                            <span className="text-xs font-bold text-amber-500 font-mono">
+                          <div className={cn("p-3 rounded-xl border hover:scale-[1.02] transition-all duration-300 text-right", tc.metricCard)}>
+                            <span className={tc.metricLabel}>التوكنات المستهلكة</span>
+                            <span className={cn("font-mono", theme === "oatmeal" ? "text-sm font-bold text-amber-800" : "text-xs font-bold text-amber-500")}>
                               {activeWorkspaceData?.tokenUsage?.total_tokens || 0}
                             </span>
                           </div>
-                          <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right">
-                            <span className="text-[8px] text-slate-500 block mb-0.5">سلامة البنية للـ Parser</span>
-                            <span className="text-xs font-bold text-emerald-400 font-mono">
+                          <div className={cn("p-3 rounded-xl border hover:scale-[1.02] transition-all duration-300 text-right", tc.metricCard)}>
+                            <span className={tc.metricLabel}>سلامة البنية للـ Parser</span>
+                            <span className={cn("text-xs font-mono", tc.metricValue)}>
                               {activeWorkspaceData?.validation_report?.attempts === 0 ? "100%" : "98%"}
                             </span>
                           </div>
-                          <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right">
-                            <span className="text-[8px] text-slate-500 block mb-0.5">زمن الاستجابة</span>
-                            <span className="text-[11px] font-bold text-emerald-400 font-mono">
+                          <div className={cn("p-3 rounded-xl border hover:scale-[1.02] transition-all duration-300 text-right", tc.metricCard)}>
+                            <span className={tc.metricLabel}>زمن الاستجابة</span>
+                            <span className={cn("font-mono", tc.metricValue, theme === "oatmeal" ? "text-sm" : "text-[11px]")}>
                               {"1850ms -> 920ms"}
                             </span>
                           </div>
-                          <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right">
-                            <span className="text-[8px] text-slate-500 block mb-0.5">حجم الكلمات الناتج</span>
-                            <span className="text-xs font-bold text-slate-300 font-mono">
+                          <div className={cn("p-3 rounded-xl border hover:scale-[1.02] transition-all duration-300 text-right", tc.metricCard)}>
+                            <span className={tc.metricLabel}>حجم الكلمات الناتج</span>
+                            <span className={cn("font-mono", tc.metricValueText)}>
                               {activeWorkspaceData?.metadata?.total_output_words || 0} كلمة
                             </span>
                           </div>
@@ -1466,22 +1553,22 @@ export default function SovereignChat() {
                     </>
                   ) : operationMode === "summarize" ? (
                     <>
-                      <div className="bg-slate-900 p-3.5 rounded-2xl border border-slate-800 space-y-1.5 shadow-inner">
-                        <span className="text-[9px] text-slate-500 font-bold block">الملف المُلخَّص</span>
-                        <div className="flex items-center justify-between text-[10px]">
-                          <span className="text-slate-300 truncate max-w-[170px] font-medium">{primaryFile?.name || "النص المباشر"}</span>
-                          <span className="text-[8px] px-1.5 py-0.5 rounded font-bold border bg-emerald-500/10 text-emerald-400 border-emerald-500/25">
+                      <div className={cn("p-3.5 rounded-2xl border space-y-1.5", tc.innerPanel)}>
+                        <span className={cn("font-bold block", tc.metricLabel)}>الملف المُلخَّص</span>
+                        <div className="flex items-center justify-between text-xs">
+                          <span className={cn("truncate max-w-[170px] font-medium", tc.uiBody)}>{primaryFile?.name || "النص المباشر"}</span>
+                          <span className={cn("px-1.5 py-0.5 rounded font-bold border text-xs", tc.badgeSummarize)}>
                             تلخيص
                           </span>
                         </div>
                       </div>
 
                       <div className="space-y-2">
-                        <span className="text-[10px] font-bold text-slate-400 block font-sans">مؤشرات التلخيص الدلالي</span>
+                        <span className={cn("block font-sans", tc.sectionLabel)}>مؤشرات التلخيص الدلالي</span>
                         <div className="grid grid-cols-2 gap-2">
-                          <div className="p-3 bg-amber-950/20 border border-amber-500/25 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right col-span-2">
-                            <span className="text-[8px] text-amber-500/80 block mb-0.5 font-bold">إجمالي التوكنات (LLM)</span>
-                            <span className="text-lg font-black text-amber-400 font-mono">
+                          <div className={cn("p-3 rounded-xl border hover:scale-[1.02] transition-all duration-300 text-right col-span-2", tc.metricCardHighlight)}>
+                            <span className={tc.metricLabelBold}>إجمالي التوكنات (LLM)</span>
+                            <span className={tc.metricTokenTotal}>
                               {(
                                 consolidationTokenUsage?.total_tokens ??
                                 summaryResult?._metadata?.token_usage?.total_tokens ??
@@ -1491,52 +1578,52 @@ export default function SovereignChat() {
                             </span>
                             {(consolidationTokenUsage?.estimated ||
                               summaryResult?._metadata?.token_usage?.estimated) && (
-                              <span className="text-[8px] text-slate-500 block mt-1">
+                              <span className={cn("block mt-1", tc.metricHint)}>
                                 * تقدير تقريبي — المزود لم يُرجع عداداً دقيقاً
                               </span>
                             )}
                           </div>
-                          <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right">
-                            <span className="text-[8px] text-slate-500 block mb-0.5">الأفكار الجوهرية</span>
-                            <span className="text-xs font-bold text-emerald-400 font-mono">
+                          <div className={cn("p-3 rounded-xl border hover:scale-[1.02] transition-all duration-300 text-right", tc.metricCard)}>
+                            <span className={tc.metricLabel}>الأفكار الجوهرية</span>
+                            <span className={cn("text-xs font-mono", tc.metricValue)}>
                               {summaryResult?.core_ideas?.length || 0}
                             </span>
                           </div>
-                          <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right">
-                            <span className="text-[8px] text-slate-500 block mb-0.5">الكلمات المفتاحية</span>
-                            <span className="text-xs font-bold text-[#38bdf8] font-mono">
+                          <div className={cn("p-3 rounded-xl border hover:scale-[1.02] transition-all duration-300 text-right", tc.metricCard)}>
+                            <span className={tc.metricLabel}>الكلمات المفتاحية</span>
+                            <span className={tc.keywordValue}>
                               {summaryResult?.sovereign_keywords?.length || 0}
                             </span>
                           </div>
                         </div>
                       </div>
 
-                      <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl text-right">
-                        <span className="text-[8px] text-slate-500 block mb-0.5">محرك التلخيص</span>
-                        <span className="text-xs font-bold text-slate-300 font-sans">
+                      <div className={cn("p-3 rounded-xl border text-right", tc.metricCard)}>
+                        <span className={tc.metricLabel}>محرك التلخيص</span>
+                        <span className={cn("font-sans", tc.metricValueText)}>
                           {summaryResult?._metadata?.engine_description || summaryResult?._metadata?.engine_utilized || "—"}
                         </span>
                       </div>
                     </>
                   ) : (
                     <>
-                      <div className="bg-slate-900 p-3.5 rounded-2xl border border-slate-800 space-y-1.5 shadow-inner">
-                        <span className="text-[9px] text-slate-500 font-bold block">الملف المُصهَر</span>
-                        <div className="flex items-center justify-between text-[10px]">
-                          <span className="text-slate-300 truncate max-w-[170px] font-medium">{primaryFile?.name || "النص المباشر"}</span>
-                          <span className="text-[8px] px-1.5 py-0.5 rounded font-bold border bg-amber-500/10 text-amber-400 border-amber-500/25">
+                      <div className={cn("p-3.5 rounded-2xl border space-y-1.5", tc.innerPanel)}>
+                        <span className={cn("font-bold block", tc.metricLabel)}>الملف المُصهَر</span>
+                        <div className="flex items-center justify-between text-xs">
+                          <span className={cn("truncate max-w-[170px] font-medium", tc.uiBody)}>{primaryFile?.name || "النص المباشر"}</span>
+                          <span className={cn("px-1.5 py-0.5 rounded font-bold border text-xs", tc.badgeMelt)}>
                             صهر
                           </span>
                         </div>
                       </div>
 
                       <div className="space-y-2">
-                        <span className="text-[10px] font-bold text-slate-400 block font-sans">مؤشرات الصهر الديناميكي</span>
+                        <span className={cn("block font-sans", tc.sectionLabel)}>مؤشرات الصهر الديناميكي</span>
 
                         <div className="grid grid-cols-2 gap-2">
-                          <div className="p-3 bg-amber-950/20 border border-amber-500/25 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right col-span-2">
-                            <span className="text-[8px] text-amber-500/80 block mb-0.5 font-bold">إجمالي التوكنات (LLM)</span>
-                            <span className="text-lg font-black text-amber-400 font-mono">
+                          <div className={cn("p-3 rounded-xl border hover:scale-[1.02] transition-all duration-300 text-right col-span-2", tc.metricCardHighlight)}>
+                            <span className={tc.metricLabelBold}>إجمالي التوكنات (LLM)</span>
+                            <span className={tc.metricTokenTotal}>
                               {(
                                 consolidationTokenUsage?.total_tokens ??
                                 summaryResult?._metadata?.token_usage?.total_tokens ??
@@ -1547,7 +1634,7 @@ export default function SovereignChat() {
                             {((consolidationTokenUsage?.input_tokens ?? 0) > 0 ||
                               (summaryResult?._metadata?.token_usage?.input_tokens ?? 0) > 0 ||
                               (consolidationTokenUsage?.llm_calls ?? 0) > 0) && (
-                              <div className="flex justify-between mt-1.5 text-[9px] font-mono text-slate-500">
+                              <div className={cn("flex justify-between mt-1.5 font-mono", tc.metricHint)}>
                                 <span>
                                   مدخل:{" "}
                                   {(
@@ -1574,45 +1661,45 @@ export default function SovereignChat() {
                             )}
                             {(consolidationTokenUsage?.estimated ||
                               summaryResult?._metadata?.token_usage?.estimated) && (
-                              <span className="text-[8px] text-slate-500 block mt-1">
+                              <span className={cn("block mt-1", tc.metricHint)}>
                                 * تقدير تقريبي — المزود لم يُرجع عداداً دقيقاً
                               </span>
                             )}
                           </div>
-                          <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right">
-                            <span className="text-[8px] text-slate-500 block mb-0.5">البطاقات / العناقيد</span>
-                            <span className="text-xs font-bold text-emerald-400 font-mono">
+                          <div className={cn("p-3 rounded-xl border hover:scale-[1.02] transition-all duration-300 text-right", tc.metricCard)}>
+                            <span className={tc.metricLabel}>البطاقات / العناقيد</span>
+                            <span className={cn("text-xs font-mono", tc.metricValue)}>
                               {summaryResult?.core_ideas?.length || 0} / {summaryResult?._metadata?.clusters_processed || 0}
                             </span>
                           </div>
-                          <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right">
-                            <span className="text-[8px] text-slate-500 block mb-0.5">الكلمات المفتاحية السيادية</span>
-                            <span className="text-xs font-bold text-[#38bdf8] font-mono">
+                          <div className={cn("p-3 rounded-xl border hover:scale-[1.02] transition-all duration-300 text-right", tc.metricCard)}>
+                            <span className={tc.metricLabel}>الكلمات المفتاحية السيادية</span>
+                            <span className={tc.keywordValue}>
                               {summaryResult?.sovereign_keywords?.length || 0} كلمات
                             </span>
                           </div>
-                          <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl hover:scale-[1.02] transition-all duration-300 text-right">
-                            <span className="text-[8px] text-slate-500 block mb-0.5">عناصر الكشاف الرقمي</span>
-                            <span className="text-xs font-bold text-[#a78bfa] font-mono">
+                          <div className={cn("p-3 rounded-xl border hover:scale-[1.02] transition-all duration-300 text-right", tc.metricCard)}>
+                            <span className={tc.metricLabel}>عناصر الكشاف الرقمي</span>
+                            <span className={tc.violetValue}>
                               {summaryResult?.numerical_ledger?.length || 0} قيم
                             </span>
                           </div>
                         </div>
                       </div>
 
-                      <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl text-right">
-                        <span className="text-[8px] text-slate-500 block mb-0.5">محرك الصهر المعتمد</span>
-                        <span className="text-xs font-bold text-slate-300 font-sans">
+                      <div className={cn("p-3 rounded-xl border text-right", tc.metricCard)}>
+                        <span className={tc.metricLabel}>محرك الصهر المعتمد</span>
+                        <span className={cn("font-sans", tc.metricValueText)}>
                           {summaryResult?._metadata?.engine_description || summaryResult?._metadata?.engine_utilized || "DeepSeek v4"}
                         </span>
                         {summaryResult?._metadata?.audit_passed === false && (
                           <div className="mt-1.5 space-y-1">
-                            <span className="text-[9px] text-amber-500 block">⚠ تحذيرات تدقيق — راجع المخرجات</span>
+                            <span className={cn("block text-xs", theme === "oatmeal" ? "text-amber-800" : "text-amber-500")}>⚠ تحذيرات تدقيق — راجع المخرجات</span>
                             {(summaryResult?._metadata?.audit_issues ||
                               summaryResult?._metadata?.audit_warnings ||
                               []
                             ).slice(0, 5).map((issue: string, i: number) => (
-                              <span key={i} className="text-[8px] text-slate-500 block leading-relaxed">
+                              <span key={i} className={cn("block leading-relaxed", tc.metricHint)}>
                                 • {issue}
                               </span>
                             ))}
@@ -1623,12 +1710,12 @@ export default function SovereignChat() {
                   )}
 
                   {/* Completion Logs summary */}
-                  <div className="bg-slate-900 p-3 rounded-2xl border border-slate-800 space-y-1.5 max-h-36 overflow-y-auto">
-                    <span className="text-[9px] text-amber-500 font-bold block">سجل المعالجة المكتملة</span>
+                  <div className={cn("p-3 rounded-2xl border space-y-1.5 max-h-36 overflow-y-auto", tc.logPanel)}>
+                    <span className={tc.logTitle}>سجل المعالجة المكتملة</span>
                     <div className="space-y-1">
                       {mergeLogs.map((log, index) => (
-                        <div key={index} className="flex items-center gap-1.5 text-[9px] text-slate-400 font-mono">
-                          <CheckCircle2 size={10} className="text-emerald-500" />
+                        <div key={index} className={cn("flex items-center gap-1.5 font-mono", tc.logLine)}>
+                          <CheckCircle2 size={12} className={theme === "oatmeal" ? "text-emerald-700 shrink-0" : "text-emerald-500 shrink-0"} />
                           <span>{log}</span>
                         </div>
                       ))}
@@ -1645,7 +1732,7 @@ export default function SovereignChat() {
                         setConsolidationTokenUsage(null);
                       }
                     }}
-                    className="w-full py-2 px-3 border border-amber-500/30 text-amber-500 hover:bg-amber-500/5 hover:scale-[1.02] transition-all duration-300 rounded-xl text-xs font-bold text-center cursor-pointer"
+                    className={cn("w-full py-2 px-3 border hover:scale-[1.02] transition-all duration-300 rounded-xl text-xs font-bold text-center cursor-pointer", tc.resetBtn)}
                   >
                     تعديل المدخلات وإعادة التشغيل
                   </button>
@@ -1657,7 +1744,7 @@ export default function SovereignChat() {
 
             {/* Launch Trigger button area */}
             {processPhase !== "completed" && processPhase !== "processing" && processPhase !== "preflight" && (
-              <div className="pt-6 border-t border-slate-800 space-y-3 mt-6">
+              <div className={cn("pt-6 border-t space-y-3 mt-6", tc.launchBorder)}>
                 <button
                   onClick={
                     operationMode === "edit"
@@ -1668,14 +1755,14 @@ export default function SovereignChat() {
                   }
                   disabled={operationMode === "edit" ? (!isReadyToRun || !isProviderReady || checkingProvider) : !isPrimaryLoaded}
                   className={cn(
-                    "w-full py-3.5 rounded-xl font-bold text-xs tracking-wide transition-all duration-300 shadow-lg cursor-pointer",
+                    "w-full py-3.5 rounded-xl font-bold text-xs tracking-wide transition-all duration-300 shadow-lg cursor-pointer border",
                     operationMode === "edit"
                       ? (isReadyToRun && isProviderReady && !checkingProvider)
-                        ? "bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-600 hover:to-amber-700 text-black hover:scale-[1.02] hover:shadow-amber-500/20"
-                        : "bg-slate-900 border border-slate-800 text-slate-600 cursor-not-allowed"
+                        ? "bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-600 hover:to-amber-700 text-stone-900 border-amber-400 hover:scale-[1.02] hover:shadow-amber-500/20"
+                        : cn(tc.ctaDisabled, "cursor-not-allowed")
                       : isPrimaryLoaded
-                      ? "bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-600 hover:to-amber-700 text-black hover:scale-[1.02] hover:shadow-amber-500/20"
-                      : "bg-slate-900 border border-slate-800 text-slate-600 cursor-not-allowed"
+                      ? "bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-600 hover:to-amber-700 text-stone-900 border-amber-400 hover:scale-[1.02] hover:shadow-amber-500/20"
+                      : cn(tc.ctaDisabled, "cursor-not-allowed"),
                   )}
                 >
                   <div className="flex items-center justify-center gap-1.5">
@@ -1698,55 +1785,57 @@ export default function SovereignChat() {
         {/* ========================================================================= */}
         {/* 2. MIDDLE PANE: LIVE EDITOR & estructured VIEWER (50-60% width)           */}
         {/* ========================================================================= */}
-        <div className="flex-1 flex flex-col bg-slate-950/40 overflow-hidden relative">
+        <div className={cn("flex-1 flex flex-col overflow-hidden relative transition-colors duration-300", tc.center)}>
           
           {/* Watermark Background Logo */}
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none select-none z-0 p-10 overflow-hidden mt-14">
             <img 
               src="/logo.png" 
               alt="خلفية مائية شعار مدونة الخليل" 
-              className="w-full max-w-[450px] md:max-w-[550px] lg:max-w-[650px] h-auto object-contain opacity-[0.08]" 
+              className={cn(
+                "w-full max-w-[450px] md:max-w-[550px] lg:max-w-[650px] h-auto object-contain object-center",
+                tc.watermarkShape,
+                tc.watermark,
+              )}
             />
           </div>
 
           {/* Central Pane Header / Tab Bar */}
-          <div className="p-4 border-b border-slate-800 bg-slate-900/75 flex items-center justify-between shrink-0 relative z-10">
-            <h3 className="text-xs font-bold text-slate-300 font-sans flex items-center gap-2">
+          <div className={cn("p-4 border-b flex items-center justify-between shrink-0 relative z-10 transition-colors duration-300", tc.paneSolid)}>
+            <h3 className={cn("text-xs font-bold font-sans flex items-center gap-2", tc.centerTitle)}>
               <BookOpen size={14} className="text-[#f59e0b]" />
               <span>
-                {processPhase === "completed" ? "المخطوطة اللغوية الموحدة" : "منضدة النص المرجعي (المراجعة والتهذيب)"}
+                {processPhase === "completed" && operationMode === "edit"
+                  ? "المخطوطة اللغوية الموحدة"
+                  : operationMode === "summarize" || operationMode === "consolidate"
+                    ? "مِنْضَدَة النص اللغوية الموحدة"
+                    : "منضدة النص المرجعي (المراجعة والتهذيب)"}
               </span>
             </h3>
 
             {/* Structured Views Tabs (Completed phase only) */}
             {processPhase === "completed" && activeWorkspaceData && (
-              <div className="flex items-center gap-1 bg-black/40 p-0.5 rounded-xl border border-slate-800">
+              <div className={cn("flex items-center gap-1 p-0.5 rounded-xl border", tc.viewModeBar)}>
                 <button 
                   onClick={() => setViewMode("split")}
-                  className={cn("px-2.5 py-1.5 rounded-lg text-[10px] font-bold transition-all duration-300 flex items-center gap-1 cursor-pointer hover:scale-[1.02]", 
-                    viewMode === "split" 
-                      ? "bg-amber-950/40 text-amber-500 border border-amber-500/30 ring-1 ring-amber-500/30 shadow-md font-extrabold" 
-                      : "text-slate-400 hover:text-slate-200")}
+                  className={cn("px-2.5 py-1.5 rounded-lg text-xs font-bold transition-all duration-300 flex items-center gap-1 cursor-pointer hover:scale-[1.02]", 
+                    viewMode === "split" ? tc.viewModeActive : tc.viewModeIdle)}
                 >
                   <ArrowRightLeft size={10} />
                   <span>العرض التفاعلي</span>
                 </button>
                 <button 
                   onClick={() => setViewMode("preview")}
-                  className={cn("px-2.5 py-1.5 rounded-lg text-[10px] font-bold transition-all duration-300 flex items-center gap-1 cursor-pointer hover:scale-[1.02]", 
-                    viewMode === "preview" 
-                      ? "bg-amber-950/40 text-amber-500 border border-amber-500/30 ring-1 ring-amber-500/30 shadow-md font-extrabold" 
-                      : "text-slate-400 hover:text-slate-200")}
+                  className={cn("px-2.5 py-1.5 rounded-lg text-xs font-bold transition-all duration-300 flex items-center gap-1 cursor-pointer hover:scale-[1.02]", 
+                    viewMode === "preview" ? tc.viewModeActive : tc.viewModeIdle)}
                 >
                   <Eye size={10} />
                   <span>النص الصافي</span>
                 </button>
                 <button 
                   onClick={() => setViewMode("json")}
-                  className={cn("px-2.5 py-1.5 rounded-lg text-[10px] font-bold transition-all duration-300 flex items-center gap-1 cursor-pointer hover:scale-[1.02]", 
-                    viewMode === "json" 
-                      ? "bg-amber-950/40 text-amber-500 border border-amber-500/30 ring-1 ring-amber-500/30 shadow-md font-extrabold" 
-                      : "text-slate-400 hover:text-slate-200")}
+                  className={cn("px-2.5 py-1.5 rounded-lg text-xs font-bold transition-all duration-300 flex items-center gap-1 cursor-pointer hover:scale-[1.02]", 
+                    viewMode === "json" ? tc.viewModeActive : tc.viewModeIdle)}
                 >
                   <Code size={10} />
                   <span>JSON الهيكلي</span>
@@ -1756,29 +1845,75 @@ export default function SovereignChat() {
           </div>
 
           {/* Central Workspace Content Panel */}
-          <div className="flex-1 p-6 overflow-y-auto min-h-0 relative z-10">
-            
-            {processPhase !== "completed" ? (
+          <div
+            className={cn(
+              "flex-1 p-6 overflow-y-auto min-h-0 relative z-10",
+              processPhase === "completed" && (activeWorkspaceData || summaryResult) && "pb-36",
+            )}
+          >
+
+            {(operationMode === "summarize" || operationMode === "consolidate") &&
+            (processPhase === "processing" || processPhase === "preflight" || processPhase === "completed") ? (
+              <MainTextWorkbench
+                summaryData={summaryResult ? normalizeWorkbenchPayload(summaryResult) : null}
+                isLoading={processPhase === "processing" || processPhase === "preflight"}
+                currentMode={operationMode}
+                showLayers={operationMode === "consolidate"}
+                actionLogs={
+                  processPhase === "processing" || processPhase === "preflight"
+                    ? mergeLogs
+                    : []
+                }
+                copiedIdeas={copiedId === "summary_ideas_copy"}
+                onCopyIdeas={
+                  summaryResult?.core_ideas?.length
+                    ? () => {
+                        const ideasText = summaryResult.core_ideas
+                          ?.map(
+                            (idea: { id: number; section_title?: string; sovereign_idea?: string; idea?: string }) =>
+                              `${idea.id}. ${idea.section_title || ""}\n${idea.sovereign_idea || idea.idea || ""}`
+                          )
+                          .join("\n\n");
+                        copyToClipboard(ideasText || "", "summary_ideas_copy");
+                      }
+                    : undefined
+                }
+              />
+            ) : processPhase !== "completed" ? (
               // Phase 1 & 2: Plain Text Editor for Primary Draft
               primaryFile ? (
                 <div className="h-full flex flex-col relative">
                   
                   {/* Processing Overlay blocker */}
                   {(processPhase === "processing" || processPhase === "preflight") && (
-                    <div className="absolute inset-0 bg-slate-950/80 backdrop-blur-sm z-20 flex flex-col items-center justify-center p-6 text-center space-y-3">
-                      <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-full text-amber-500 animate-pulse">
-                        <Cpu size={24} />
+                    <div className={cn("absolute inset-0 backdrop-blur-sm z-20 flex flex-col items-center justify-center p-8 transition-colors duration-300", tc.overlay)}>
+                      <div className={cn("w-full max-w-2xl rounded-xl border p-6 space-y-4", tc.card)}>
+                        <div className="flex items-start gap-4 justify-center">
+                          <ProcessingBrandSpinner size="md" />
+                          <div className="flex-1 text-right space-y-3 min-w-0">
+                            <h4 className={cn("font-bold font-sans", VIEWPORT_TEXT, tc.overlayTitle)}>
+                              {TASK_LOADING_PRIMARY[operationMode as keyof typeof TASK_LOADING_PRIMARY]}
+                            </h4>
+                            {mergeLogs.length > 0 && (
+                              <div className={cn("rounded-xl border p-4 space-y-2", tc.innerPanel)}>
+                                {mergeLogs.map((log, index) => (
+                                  <p
+                                    key={index}
+                                    className={cn(
+                                      "text-justify font-sans leading-relaxed",
+                                      index === mergeLogs.length - 1
+                                        ? cn("font-bold text-lg", tc.overlayTitle)
+                                        : cn("text-base", tc.overlaySub),
+                                    )}
+                                  >
+                                    {log}
+                                  </p>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        </div>
                       </div>
-                      <h4 className={cn("font-bold text-white", VIEWPORT_TEXT)}>
-                        {TASK_LOADING_PRIMARY[operationMode]}
-                      </h4>
-                      <p className={cn("text-slate-500 max-w-sm text-justify font-medium", VIEWPORT_TEXT)}>
-                        {operationMode === "summarize"
-                          ? "Map-Reduce عنقودي — كل فصل يُعالج مستقلاً."
-                          : operationMode === "consolidate"
-                            ? "صهر المحاور السبعة وفق ملف الأصل المرجعي."
-                            : "مطابقة الأفكار وسبك المسودات في استدعاء واحد."}
-                      </p>
                     </div>
                   )}
 
@@ -1786,18 +1921,22 @@ export default function SovereignChat() {
                     value={primaryText}
                     onChange={(e) => setPrimaryText(e.target.value)}
                     disabled={processPhase === "processing" || processPhase === "preflight" || primaryFile.status !== "success"}
-                    className={cn("w-full flex-1 bg-transparent border-0 focus:ring-0 focus:outline-none text-slate-300 text-justify font-sans resize-none", VIEWPORT_TEXT)}
+                    className={cn(
+                      "w-full flex-1 bg-transparent border-0 focus:ring-0 focus:outline-none text-justify font-sans resize-none",
+                      VIEWPORT_TEXT,
+                      tc.extractedText,
+                    )}
                     placeholder="اكتب أو هذّب النص المرجعي الأساسي هنا..."
                   />
                 </div>
               ) : (
                 // Initial empty state
-                <div className="h-full flex flex-col items-center justify-center text-center p-8 border border-dashed border-slate-800 rounded-2xl bg-slate-900/10 relative z-10">
-                  <div className="p-4 bg-slate-900/60 border border-slate-800 rounded-full text-slate-600 mb-4">
-                    <FileText size={32} />
+                <div className={cn("h-full flex flex-col items-center justify-center text-center p-8 border border-dashed rounded-2xl relative z-10", tc.emptyPanel)}>
+                  <div className={cn("p-4 rounded-full mb-4 border", tc.card)}>
+                    <FileText size={32} className={tc.textMuted} />
                   </div>
-                  <h4 className="text-sm font-bold text-slate-300">منضدة النص المرجعي</h4>
-                  <p className="text-xs text-slate-500 max-w-xs leading-relaxed mt-2 font-medium">
+                  <h4 className={tc.emptyTitle}>منضدة النص المرجعي</h4>
+                  <p className={cn("max-w-xs mt-2 font-medium", tc.emptyBody)}>
                     يرجى إيداع النص المرجعي من لوحة التوجيه الجانبية للبدء بالمراجعة والتهذيب قبل السبك اللغوي.
                   </p>
                 </div>
@@ -1828,25 +1967,25 @@ export default function SovereignChat() {
                               onClick={() => handleBlockClick(block)}
                               className={cn(
                                 "p-4 rounded-2xl cursor-pointer transition-all duration-300 relative group/block",
-                                isHeading 
-                                  ? "border-b border-slate-800 pb-2 hover:bg-white/5" 
-                                  : isPrimary 
-                                  ? "bg-slate-900 border border-slate-800 hover:border-amber-500/30 hover:bg-slate-900/80" 
-                                  : "border-r-4 border-r-emerald-500 border-t border-l border-b border-emerald-500/20 bg-[#022c22]/80 hover:bg-[#022c22]/95 pl-4 pr-3 py-3 rounded-l-2xl rounded-r-sm shadow-inner",
-                                isBlockActive && "ring-2 ring-amber-500/30 bg-slate-900/60 border-amber-500",
-                                isBlockHighlighted && "animate-pulse ring-2 ring-amber-500/50 border-amber-500 bg-amber-950/30"
+                                isHeading
+                                  ? tc.draftBlockHeading
+                                  : isPrimary
+                                    ? tc.draftBlockPrimary
+                                    : tc.draftBlockMerged,
+                                isBlockActive && tc.draftBlockActive,
+                                isBlockHighlighted && tc.draftBlockHighlight,
                               )}
                             >
                               {/* Hover tooltip for sub-draft paragraph */}
                               {!isPrimary && assocIdea && (
-                                <div className="absolute z-50 hidden group-hover/block:block bg-slate-950 border border-emerald-500/20 p-3 rounded-xl text-[10px] text-slate-200 w-72 shadow-2xl pointer-events-none -top-14 right-2 leading-relaxed">
-                                  <span className="font-bold text-amber-500 block mb-1">💡 فكرة مدمجة ({assocIdea.id})</span>
+                                <div className={cn("absolute z-50 hidden group-hover/block:block p-3 rounded-xl text-xs w-72 pointer-events-none -top-14 right-2 leading-relaxed", tc.draftTooltip)}>
+                                  <span className={cn("font-bold block mb-1", tc.headingAccent)}>💡 فكرة مدمجة ({assocIdea.id})</span>
                                   <span>{assocIdea.content}</span>
                                 </div>
                               )}
 
                               {isHeading ? (
-                                <h3 className="text-sm font-bold text-slate-200 flex items-center gap-2">
+                                <h3 className={cn("text-sm font-bold flex items-center gap-2", tc.draftHeadingText)}>
                                   <span className="w-1 h-3.5 bg-gradient-to-b from-amber-500 to-amber-600 rounded-full"></span>
                                   {block.text}
                                 </h3>
@@ -1854,22 +1993,22 @@ export default function SovereignChat() {
                                 <div>
                                   {/* Sub-draft info badge displayed above paragraph */}
                                   {!isPrimary && (
-                                    <div className="text-[9px] text-emerald-400 font-bold mb-1.5 flex items-center gap-1.5">
+                                    <div className={cn("text-xs font-bold mb-1.5 flex items-center gap-1.5", tc.draftMergedBadge)}>
                                       <span>💡 فكرة مدمجة: {block.associated_idea_id}</span>
                                       <span>•</span>
                                       <span>المخطوطة المصدر: {block.source}</span>
                                     </div>
                                   )}
-                                  <p className="text-sm text-slate-300 leading-relaxed text-justify">
+                                  <p className={cn("text-base leading-relaxed text-justify", theme === "oatmeal" ? "text-stone-900" : tc.manuscriptBody)}>
                                     {block.text}
                                   </p>
                                 </div>
                               )}
 
-                              <div className="mt-2.5 pt-2 border-t border-slate-800 flex items-center justify-between text-[9px] text-slate-500">
-                                <span>المصدر: <strong className={isPrimary ? "text-slate-400" : "text-emerald-400 font-bold"}>{block.source}</strong></span>
+                              <div className={cn("mt-2.5 pt-2 border-t flex items-center justify-between text-xs", tc.draftMetaFooter)}>
+                                <span>المصدر: <strong className={isPrimary ? tc.draftMetaSourcePrimary : tc.draftMetaSourceMerged}>{block.source}</strong></span>
                                 {hasIdea && (
-                                  <span className="flex items-center gap-1 text-[8px] text-emerald-400 bg-emerald-400/5 px-2 py-0.5 rounded border border-emerald-500/10 font-mono">
+                                  <span className={cn("flex items-center gap-1 text-xs px-2 py-0.5 rounded border font-mono", tc.draftIdeaIdBadge)}>
                                     ID: {block.associated_idea_id}
                                   </span>
                                 )}
@@ -1883,7 +2022,7 @@ export default function SovereignChat() {
                     {/* VIEW MODE 2: PLAIN MANUSCRIPT PREVIEW */}
                     {viewMode === "preview" && (
                       <div className="max-w-3xl mx-auto w-full space-y-6 pb-12">
-                        <div className="text-sm text-slate-300 leading-relaxed whitespace-pre-wrap select-text text-justify font-medium">
+                        <div className={cn("text-sm leading-relaxed whitespace-pre-wrap select-text text-justify font-medium", tc.manuscriptBody)}>
                           {activeWorkspaceData.content}
                         </div>
                       </div>
@@ -1896,227 +2035,39 @@ export default function SovereignChat() {
                           readOnly
                           value={JSON.stringify(activeWorkspaceData, null, 2)}
                           dir="ltr"
-                          className="flex-1 w-full p-4 bg-black/40 border border-slate-800 rounded-xl text-[10px] font-mono text-emerald-400 focus:outline-none resize-none overflow-y-auto leading-relaxed shadow-inner"
+                          className={cn("flex-1 w-full p-4 rounded-xl text-xs font-mono focus:outline-none resize-none overflow-y-auto leading-relaxed shadow-inner border", tc.jsonViewer)}
                         />
                       </div>
                     )}
 
                   </div>
                 )
-              ) : (
-                summaryResult && (
-                  <div className="space-y-6 pb-12 select-text">
-                    {/* 0. Editorial suggestions v4.5 */}
-                    {(
-                      summaryResult._metadata?.editorial_suggestions ||
-                      summaryResult._metadata?.audit_warnings ||
-                      []
-                    ).length > 0 && (
-                      <div className="bg-amber-950/25 p-5 rounded-2xl border border-amber-500/35 space-y-3">
-                        <h4 className={cn("font-bold text-amber-400 flex items-center gap-2", VIEWPORT_TEXT)}>
-                          <AlertTriangle size={18} />
-                          <span>إرشادات التدقيق التحريري</span>
-                        </h4>
-                        <ul className="space-y-2">
-                          {(summaryResult._metadata?.editorial_suggestions ||
-                            summaryResult._metadata?.audit_warnings ||
-                            []
-                          ).map((tip: string, i: number) => (
-                            <li key={i} className={cn("text-amber-200/90 text-justify pr-2", VIEWPORT_TEXT)}>
-                              • {tip}
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
-
-                    {/* 1. Sovereign Keywords Row */}
-                    <div className="bg-slate-900/60 p-5 rounded-2xl border border-slate-850 space-y-3">
-                      <h4 className="text-xs font-bold text-amber-400 flex items-center gap-1.5">
-                        <Sparkles size={14} />
-                        <span>📌 الكلمات المفتاحية السيادية</span>
-                      </h4>
-                      <div className="flex flex-wrap gap-2 pt-1">
-                        {summaryResult.sovereign_keywords?.map((kw: string, i: number) => (
-                          <span key={i} className="px-3 py-1 bg-amber-500/5 text-amber-400 border border-amber-500/20 rounded-full text-xs font-semibold font-sans tracking-wide">
-                            {kw}
-                          </span>
-                        ))}
-                      </div>
-                    </div>
-
-                    {/* 2. Core Ideas */}
-                    <div className="bg-slate-900/60 p-5 rounded-2xl border border-slate-850 space-y-4">
-                      <div className="flex items-center justify-between border-b border-slate-800 pb-2">
-                        <h4 className="text-xs font-bold text-amber-400 flex items-center gap-1.5">
-                          <Layers size={14} />
-                          <span>
-                            {operationMode === "consolidate"
-                              ? "💡 البطاقات المعرفية السيادية"
-                              : "💡 الأفكار الجوهرية"}
-                          </span>
-                        </h4>
-                        <button
-                          onClick={() => {
-                            const ideasText = summaryResult.core_ideas?.map((idea: any) =>
-                              `${idea.id}. ${idea.section_title || ""}\n${idea.sovereign_idea || idea.idea || ""}`
-                            ).join("\n\n");
-                            copyToClipboard(ideasText, "summary_ideas_copy");
-                          }}
-                          className="flex items-center gap-1 text-[10px] text-amber-500 hover:underline cursor-pointer"
-                        >
-                          {copiedId === "summary_ideas_copy" ? <Check size={10} /> : <Copy size={10} />}
-                          <span>{copiedId === "summary_ideas_copy" ? "تم النسخ" : "نسخ الأفكار الجوهرية"}</span>
-                        </button>
-                      </div>
-                      <div className="space-y-2.5">
-                        {summaryResult.core_ideas?.map((idea: any, i: number) => (
-                          <div key={i} className="p-3 bg-slate-950/60 border border-slate-850 rounded-xl space-y-2">
-                            <div className="flex items-start gap-3">
-                              <span className="w-5 h-5 bg-amber-500/10 text-amber-400 border border-amber-500/20 rounded-lg flex items-center justify-center text-[10px] font-bold font-mono shrink-0 mt-0.5">
-                                {idea.id}
-                              </span>
-                              <div className="space-y-1">
-                                {idea.section_title && (
-                                  <p className="text-[10px] font-bold text-amber-500/80">{idea.section_title}</p>
-                                )}
-                                <p className={cn("text-slate-300 text-justify", VIEWPORT_TEXT)}>{idea.sovereign_idea || idea.idea}</p>
-                              </div>
-                            </div>
-                            {idea.layers?.practical_applications && (
-                              <p className={cn("text-slate-400 pr-8 text-justify", VIEWPORT_TEXT)}>
-                                <span className="text-slate-300 font-bold">التطبيقات: </span>{idea.layers.practical_applications}
-                              </p>
-                            )}
-                            {idea.layers?.conceptual_framework && (
-                              <p className={cn("text-slate-400 pr-8 text-justify", VIEWPORT_TEXT)}>
-                                <span className="text-slate-300 font-bold">الإطار: </span>{idea.layers.conceptual_framework}
-                              </p>
-                            )}
-                            {idea.discovered_styles?.length > 0 && (
-                              <p className="text-[9px] text-slate-600 pr-8">أنماط: {idea.discovered_styles.join(" · ")}</p>
-                            )}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-
-                    {/* 3. Numerical Ledger */}
-                    <div className="bg-slate-900/60 p-5 rounded-2xl border border-slate-850 space-y-4">
-                      <h4 className="text-xs font-bold text-amber-400 flex items-center gap-1.5">
-                        <Activity size={14} />
-                        <span>🔢 الكشاف الرقمي والتواريخ الحيوية</span>
-                      </h4>
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                        {summaryResult.numerical_ledger?.map((num: any, i: number) => (
-                          <div key={i} className="p-3 bg-slate-950/60 border border-slate-850 rounded-xl space-y-1.5">
-                            <div className="flex items-center justify-between">
-                              <span className="px-2 py-0.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded text-[9px] font-bold font-mono">
-                                {num.value}
-                              </span>
-                            </div>
-                            <p className="text-[10px] text-slate-400 leading-relaxed italic">"{num.context}"</p>
-                          </div>
-                        ))}
-                        {(!summaryResult.numerical_ledger || summaryResult.numerical_ledger.length === 0) && (
-                          <div className="p-3 bg-slate-950/60 border border-slate-850 rounded-xl text-center text-xs text-slate-500 col-span-2">
-                            لا توجد أرقام أو تواريخ بارزة في النص.
-                          </div>
-                        )}
-                      </div>
-                    </div>
-
-                    {/* 4. Export & Copy Panel */}
-                    {summaryFormat === "markdown" && summaryResult.export_content && (
-                      <div className="bg-slate-900/60 p-5 rounded-2xl border border-slate-850 space-y-3">
-                        <div className="flex items-center justify-between border-b border-slate-800 pb-2">
-                          <h4 className="text-xs font-bold text-slate-300">مستند التصدير الجاهز (Markdown)</h4>
-                          <button
-                            onClick={() => copyToClipboard(summaryResult.export_content, "summary_export")}
-                            className="flex items-center gap-1 text-[10px] text-amber-500 hover:underline cursor-pointer"
-                          >
-                            {copiedId === "summary_export" ? <Check size={10} /> : <Copy size={10} />}
-                            <span>{copiedId === "summary_export" ? "تم النسخ" : "نسخ التلخيص"}</span>
-                          </button>
-                        </div>
-                        <pre className="p-4 bg-slate-950 rounded-xl text-[10px] text-slate-400 font-mono overflow-x-auto max-h-60 leading-relaxed whitespace-pre-wrap select-text">
-                          {summaryResult.export_content}
-                        </pre>
-                      </div>
-                    )}
-
-                    {summaryFormat === "json" && (
-                      <div className="bg-slate-900/60 p-5 rounded-2xl border border-slate-850 space-y-3">
-                        <div className="flex items-center justify-between border-b border-slate-800 pb-2">
-                          <h4 className="text-xs font-bold text-slate-300">مستند التصدير الجاهز (JSON)</h4>
-                          <button
-                            onClick={() => copyToClipboard(JSON.stringify(summaryResult, null, 2), "summary_export_json")}
-                            className="flex items-center gap-1 text-[10px] text-amber-500 hover:underline cursor-pointer"
-                          >
-                            {copiedId === "summary_export_json" ? <Check size={10} /> : <Copy size={10} />}
-                            <span>{copiedId === "summary_export_json" ? "تم النسخ" : "نسخ التلخيص (JSON)"}</span>
-                          </button>
-                        </div>
-                        <pre className="p-4 bg-slate-950 rounded-xl text-[10px] text-slate-400 font-mono overflow-x-auto max-h-60 leading-relaxed whitespace-pre-wrap select-text">
-                          {JSON.stringify(summaryResult, null, 2)}
-                        </pre>
-                      </div>
-                    )}
-                  </div>
-                )
-              )
+              ) : null
             )}
 
           </div>
 
           {/* Export Action Bar (Completed phase only, fixed to bottom) */}
           {processPhase === "completed" && (activeWorkspaceData || summaryResult) && (
-            <div className="absolute bottom-0 left-0 right-0 p-3 border-t border-slate-800 bg-slate-900/95 backdrop-blur z-20 flex justify-end gap-3 shrink-0">
-              {activeWorkspaceData ? (
-                <>
-                  <button 
-                    onClick={() => copyToClipboard(activeWorkspaceData.content, "workspace_draft")}
-                    className="px-4 py-2 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all duration-300 cursor-pointer text-slate-200 hover:border-amber-500/30 hover:scale-[1.02]"
-                  >
-                    {copiedId === "workspace_draft" ? <Check size={12} className="text-emerald-400" /> : <Copy size={12} />}
-                    <span>نسخ النص الصافي الموحد</span>
-                  </button>
-                  <button 
-                    onClick={() => handleDownload(JSON.stringify(activeWorkspaceData, null, 2), "workspace_json")}
-                    className="px-4 py-2 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all duration-300 cursor-pointer text-slate-200 hover:border-amber-500/30 hover:scale-[1.02]"
-                  >
-                    <Download size={12} />
-                    <span>تصدير JSON المخرجات</span>
-                  </button>
-                </>
-              ) : (
-                <>
-                  {operationMode === "consolidate" && (
-                    <button 
-                      onClick={handleDownloadDocx}
-                      className="px-4 py-2 bg-gradient-to-r from-amber-500/90 to-amber-600/90 hover:from-amber-500 hover:to-amber-600 border border-amber-500/40 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all duration-300 cursor-pointer text-black hover:scale-[1.02] shadow-md"
-                    >
-                      <Download size={12} />
-                      <span>تصدير Word منسّق</span>
-                    </button>
-                  )}
-                  <button 
-                    onClick={() => copyToClipboard(summaryResult.export_content || "", "summary_export_action")}
-                    className="px-4 py-2 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all duration-300 cursor-pointer text-slate-200 hover:border-amber-500/30 hover:scale-[1.02]"
-                  >
-                    {copiedId === "summary_export_action" ? <Check size={12} className="text-emerald-400" /> : <Copy size={12} />}
-                    <span>نسخ Markdown</span>
-                  </button>
-                  <button 
-                    onClick={() => handleDownload(JSON.stringify(summaryResult, null, 2), "summary_json")}
-                    className="px-4 py-2 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all duration-300 cursor-pointer text-slate-200 hover:border-amber-500/30 hover:scale-[1.02]"
-                  >
-                    <Download size={12} />
-                    <span>تصدير JSON</span>
-                  </button>
-                </>
-              )}
-            </div>
+            <ExportActionBar
+              theme={theme}
+              copiedId={copiedId}
+              onCopy={copyToClipboard}
+              context={
+                activeWorkspaceData
+                  ? {
+                      kind: "edit",
+                      workspace: activeWorkspaceData,
+                      sourceFilename: primaryFile?.name,
+                    }
+                  : {
+                      kind: "analytics",
+                      mode: operationMode === "consolidate" ? "consolidate" : "summarize",
+                      summaryResult,
+                      sourceFilename: primaryFile?.name,
+                    }
+              }
+            />
           )}
 
         </div>
@@ -2125,23 +2076,23 @@ export default function SovereignChat() {
         {/* 3. LEFT PANE: CHECKLIST & ATOMIC IDEAS PANE (22-25% width)                 */}
         {/* ========================================================================= */}
         {operationMode === "edit" && hasSubDrafts !== false && (
-          <div className="w-full lg:w-[280px] xl:w-[320px] shrink-0 border-r border-slate-800 bg-slate-950/50 backdrop-blur flex flex-col overflow-y-auto z-10">
+          <div className={cn("w-full lg:w-[280px] xl:w-[320px] shrink-0 border-r backdrop-blur flex flex-col overflow-y-auto z-10 transition-colors duration-300", tc.pane)}>
             <div className="p-5 flex-1 flex flex-col">
               
-              <div className="pb-3 border-b border-slate-800 mb-4">
-                <h3 className="text-sm font-extrabold text-slate-300 flex items-center gap-2 font-sans">
+              <div className={cn("pb-3 border-b mb-4", tc.sectionDivider)}>
+                <h3 className={cn("text-sm font-extrabold flex items-center gap-2 font-sans", tc.deltaPaneTitle)}>
                   <Activity size={14} className="text-[#f59e0b]" />
                   قائمة الفحص والمطابقة (Delta)
                 </h3>
-                <p className="text-[10px] text-slate-500 mt-1 leading-relaxed font-sans font-medium">
+                <p className={cn("text-xs mt-1 leading-relaxed font-sans font-medium", tc.deltaPaneSub)}>
                   مصفوفة الأفكار الذرية الإضافية التي تم استخلاصها ومطابقتها مع المرجع.
                 </p>
               </div>
 
               {processPhase !== "completed" ? (
                 // Checklist Placeholder before processing
-                <div className="flex-1 flex flex-col items-center justify-center text-center p-6 text-slate-600 opacity-60">
-                  <BookOpen size={28} className="mb-2 text-slate-700" />
+                <div className={cn("flex-1 flex flex-col items-center justify-center text-center p-6 opacity-60", tc.deltaWait)}>
+                  <BookOpen size={28} className={cn("mb-2", tc.textMuted)} />
                   <p className="text-xs font-medium">في انتظار إيداع النصوص واستخراج الفروق اللغوية...</p>
                 </div>
               ) : (
@@ -2159,36 +2110,36 @@ export default function SovereignChat() {
                           ref={(el) => { ideaRefs.current[idea.id] = el; }}
                           onClick={() => handleIdeaClick(idea.id)}
                           className={cn(
-                            "p-3.5 rounded-xl border text-right cursor-pointer transition-all duration-300 relative group hover:scale-[1.02] shadow-sm hover:shadow-md",
-                            isActive 
-                              ? "bg-amber-950/40 border-amber-500 shadow-lg shadow-amber-500/10 translate-x-1 ring-1 ring-amber-500/30 font-semibold" 
+                            "p-3.5 rounded-xl border text-right cursor-pointer transition-all duration-300 relative group hover:scale-[1.02]",
+                            isActive
+                              ? tc.deltaIdeaActive
                               : isHighlighted
-                              ? "bg-emerald-950/80 border-emerald-500 scale-[1.02] ring-1 ring-emerald-500/20"
-                              : "bg-slate-900 border border-slate-800/80 hover:bg-slate-900/90 hover:border-amber-500/30"
+                                ? tc.deltaIdeaHighlight
+                                : tc.deltaIdeaCard,
                           )}
                         >
                           <div className="flex items-center justify-between mb-2">
-                            <span className="text-[8px] font-mono font-bold text-amber-500/80 bg-amber-500/5 px-2 py-0.5 rounded border border-amber-500/10">
+                            <span className={cn("text-xs font-mono font-bold px-2 py-0.5 rounded border", tc.deltaIdeaId)}>
                               {idea.id}
                             </span>
                             {isConsolidated ? (
-                              <span className="flex items-center gap-0.5 text-[8px] text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded font-bold border border-emerald-500/20">
-                                <CheckCircle2 size={10} className="text-emerald-400" />
+                              <span className={cn("flex items-center gap-0.5 text-xs px-2 py-0.5 rounded font-bold border", tc.deltaStatusMerged)}>
+                                <CheckCircle2 size={10} className={theme === "oatmeal" ? "text-emerald-700" : "text-emerald-400"} />
                                 مدمجة
                               </span>
                             ) : (
-                              <span className="flex items-center gap-0.5 text-[8px] text-amber-400 bg-amber-500/10 px-2 py-0.5 rounded font-bold border border-amber-500/25">
-                                <AlertTriangle size={10} className="text-amber-400" />
+                              <span className={cn("flex items-center gap-0.5 text-xs px-2 py-0.5 rounded font-bold border", tc.deltaStatusPending)}>
+                                <AlertTriangle size={10} className={theme === "oatmeal" ? "text-amber-700" : "text-amber-400"} />
                                 غير مدمجة
                               </span>
                             )}
                           </div>
                           
-                          <p className="text-xs text-slate-300 leading-relaxed font-semibold">
+                          <p className={cn("text-sm leading-relaxed font-semibold", tc.deltaIdeaText)}>
                             {idea.content}
                           </p>
                           
-                          <div className="mt-2.5 pt-2 border-t border-slate-800 flex items-center justify-between text-[8px] text-slate-500 font-medium">
+                          <div className={cn("mt-2.5 pt-2 border-t flex items-center justify-between text-xs font-medium", tc.draftMetaFooter)}>
                             <span className="truncate max-w-[130px]" title={idea.source_draft}>المصدر: {idea.source_draft}</span>
                           </div>
                         </div>
@@ -2196,7 +2147,7 @@ export default function SovereignChat() {
                     })}
                   </div>
                 ) : (
-                  <div className="text-center text-xs text-slate-600 py-8">لا توجد أفكار ذرية إضافية مدمجة.</div>
+                  <div className={cn("text-center text-xs py-8", tc.deltaEmpty)}>لا توجد أفكار ذرية إضافية مدمجة.</div>
                 )
               )}
 

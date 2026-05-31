@@ -9,7 +9,9 @@ langchain-openai
 langchain-google-genai
 python-multipart
 python-docx
+orjson>=3.9.0
 pypdf>=4.0.0
+pymupdf>=1.24.0
 striprtf>=0.0.26
 httpx
 termcolor
